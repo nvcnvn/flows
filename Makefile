@@ -1,4 +1,4 @@
-.PHONY: help build test run-example docker-db migrate clean
+.PHONY: help build test test-coverage docker-up docker-down docker-clean clean lint fmt deps ci-test ci-lint
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -6,38 +6,47 @@ help: ## Show this help
 build: ## Build the project
 	go build -v ./...
 
-test: ## Run tests
-	go test -v ./...
+docker-up: ## Start PostgreSQL 18 using Docker Compose
+	docker-compose up -d
+	@echo "Waiting for PostgreSQL to be ready..."
+	@sleep 5
 
-run-example: ## Run the order example
-	go run examples/order/main.go
+docker-down: ## Stop Docker Compose services
+	docker-compose down
 
-docker-db: ## Start PostgreSQL 18 in Docker
-	docker run --name flows-postgres \
-		-e POSTGRES_PASSWORD=postgres \
-		-e POSTGRES_DB=flows \
-		-p 5432:5432 \
-		-d postgres:18
+docker-clean: ## Remove Docker volumes
+	docker-compose down -v
 
-migrate: ## Run database migrations
-	psql -h localhost -U postgres -d flows -f migrations/001_init.sql
+test: docker-up ## Run all tests
+	@export DATABASE_URL="postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable" && \
+	go test -count 2 -v -race ./...
 
-stop-db: ## Stop PostgreSQL Docker container
-	docker stop flows-postgres
-	docker rm flows-postgres
+test-coverage: docker-up ## Run tests with coverage
+	@export DATABASE_URL="postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable" && \
+	go test -count 2 -v -race -coverprofile=coverage.out -covermode=atomic ./... && \
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated: coverage.html"
 
-clean: ## Clean build artifacts
-	go clean
-	rm -rf bin/
+lint: ## Run linter
+	golangci-lint run --timeout=5m
 
 fmt: ## Format code
 	go fmt ./...
-
-vet: ## Run go vet
-	go vet ./...
+	goimports -w .
 
 deps: ## Download dependencies
 	go mod download
 	go mod tidy
+
+# CI targets
+ci-test: ## Run tests in CI environment
+	go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+ci-lint: ## Run linter in CI
+	golangci-lint run --timeout=5m
+
+clean: docker-down ## Clean up build artifacts
+	rm -f coverage.out coverage.html
+	go clean -testcache
 
 .DEFAULT_GOAL := help

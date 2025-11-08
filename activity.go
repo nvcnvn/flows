@@ -16,6 +16,22 @@ type Activity[In, Out any] struct {
 	outputType  registry.TypeInfo
 }
 
+// ActivityRegistryEntry stores the activity definition along with type information.
+type ActivityRegistryEntry struct {
+	activity   interface{} // *Activity[In, Out]
+	inputType  registry.TypeInfo
+	outputType registry.TypeInfo
+}
+
+// ActivityRegistry stores registered activities for execution.
+type ActivityRegistry struct {
+	activities map[string]*ActivityRegistryEntry // name -> registry entry
+}
+
+var globalActivityRegistry = &ActivityRegistry{
+	activities: make(map[string]*ActivityRegistryEntry),
+}
+
 // NewActivity creates a new activity definition.
 func NewActivity[In, Out any](
 	name string,
@@ -26,13 +42,22 @@ func NewActivity[In, Out any](
 	inputType := registry.Register[In]()
 	outputType := registry.Register[Out]()
 
-	return &Activity[In, Out]{
+	act := &Activity[In, Out]{
 		name:        name,
 		fn:          fn,
 		retryPolicy: retryPolicy,
 		inputType:   inputType,
 		outputType:  outputType,
 	}
+
+	// Register activity in global registry with type information
+	globalActivityRegistry.activities[name] = &ActivityRegistryEntry{
+		activity:   act,
+		inputType:  inputType,
+		outputType: outputType,
+	}
+
+	return act
 }
 
 // Name returns the activity name.

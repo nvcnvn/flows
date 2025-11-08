@@ -150,16 +150,49 @@ func sendSignalInternal[P any](
 		Consumed:   false,
 	}
 
+	// Get workflow info to enqueue task
+	wf, err := store.GetWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	if err != nil {
+		return fmt.Errorf("failed to get workflow: %w", err)
+	}
+
+	// Create workflow task to resume execution
+	taskModel := &storage.TaskQueueModel{
+		ID:                storage.UUIDToPgtype(uuid.New()),
+		TenantID:          storage.UUIDToPgtype(tenantID),
+		WorkflowID:        storage.UUIDToPgtype(workflowID),
+		WorkflowName:      wf.Name,
+		TaskType:          string(TaskTypeWorkflow),
+		VisibilityTimeout: time.Now(),
+	}
+
 	// Execute within transaction if provided
 	if cfg.tx != nil {
 		pgxTx, ok := cfg.tx.(pgx.Tx)
 		if !ok {
 			return fmt.Errorf("invalid transaction type")
 		}
-		return store.CreateSignal(ctx, signalModel, pgxTx)
+		if err := store.CreateSignal(ctx, signalModel, pgxTx); err != nil {
+			return err
+		}
+		return store.EnqueueTask(ctx, taskModel, pgxTx)
 	}
 
-	return store.CreateSignal(ctx, signalModel, nil)
+	// Use transaction to ensure atomicity
+	tx, err := store.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := store.CreateSignal(ctx, signalModel, tx); err != nil {
+		return err
+	}
+	if err := store.EnqueueTask(ctx, taskModel, tx); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // Query retrieves the current status of a workflow.

@@ -71,6 +71,37 @@ func (s *Store) ConsumeSignal(ctx context.Context, tenantID, signalID pgtype.UUI
 	return err
 }
 
+// GetSignalsByWorkflow retrieves all signals for a workflow.
+func (s *Store) GetSignalsByWorkflow(ctx context.Context, tenantID, workflowID pgtype.UUID) ([]*SignalModel, error) {
+	query := `
+		SELECT id, tenant_id, workflow_id, signal_name, payload, consumed
+		FROM signals
+		WHERE tenant_id = $1 AND workflow_id = $2
+		ORDER BY id ASC
+	`
+
+	rows, err := s.pool.Query(ctx, query, tenantID, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var signals []*SignalModel
+	for rows.Next() {
+		sig := &SignalModel{}
+		err := rows.Scan(
+			&sig.ID, &sig.TenantID, &sig.WorkflowID, &sig.SignalName,
+			&sig.Payload, &sig.Consumed,
+		)
+		if err != nil {
+			return nil, err
+		}
+		signals = append(signals, sig)
+	}
+
+	return signals, rows.Err()
+}
+
 // CreateTimer creates a new timer in the database.
 func (s *Store) CreateTimer(ctx context.Context, timer *TimerModel, tx interface{}) error {
 	query := `
