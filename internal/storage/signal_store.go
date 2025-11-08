@@ -172,6 +172,37 @@ func (s *Store) MarkTimerFired(ctx context.Context, tenantID, timerID pgtype.UUI
 	return err
 }
 
+// GetTimersByWorkflow retrieves all timers for a workflow.
+func (s *Store) GetTimersByWorkflow(ctx context.Context, tenantID, workflowID pgtype.UUID) ([]*TimerModel, error) {
+	query := `
+		SELECT id, tenant_id, workflow_id, sequence_num, fire_at, fired
+		FROM timers
+		WHERE tenant_id = $1 AND workflow_id = $2
+		ORDER BY sequence_num ASC
+	`
+
+	rows, err := s.pool.Query(ctx, query, tenantID, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var timers []*TimerModel
+	for rows.Next() {
+		timer := &TimerModel{}
+		err := rows.Scan(
+			&timer.ID, &timer.TenantID, &timer.WorkflowID,
+			&timer.SequenceNum, &timer.FireAt, &timer.Fired,
+		)
+		if err != nil {
+			return nil, err
+		}
+		timers = append(timers, timer)
+	}
+
+	return timers, rows.Err()
+}
+
 // CreateHistoryEvent creates a history event.
 func (s *Store) CreateHistoryEvent(ctx context.Context, event *HistoryEventModel, tx interface{}) error {
 	query := `

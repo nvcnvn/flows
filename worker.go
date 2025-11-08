@@ -402,7 +402,38 @@ func (w *Worker) executeWorkflow(
 
 	// Load timer results for replay
 	timerResults := make(map[int]time.Time)
-	// Note: Timers are tracked by fired status, not stored in separate results
+	timers, err := w.store.GetTimersByWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	if err != nil {
+		return fmt.Errorf("failed to load timers: %w", err)
+	}
+
+	for _, timer := range timers {
+		if timer.Fired {
+			// Store the fire time for fired timers so they skip on replay
+			timerResults[timer.SequenceNum] = timer.FireAt
+		}
+	}
+
+	// Load time results for replay from history events
+	timeResults := make(map[int]time.Time)
+	historyEvents, err := w.store.GetHistoryEvents(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	if err != nil {
+		return fmt.Errorf("failed to load history events: %w", err)
+	}
+
+	for _, event := range historyEvents {
+		if event.EventType == string(EventTimeRecorded) {
+			// Parse the recorded time from event data
+			var eventData map[string]interface{}
+			if err := json.Unmarshal(event.EventData, &eventData); err == nil {
+				if timeStr, ok := eventData["recorded_time"].(string); ok {
+					if recordedTime, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
+						timeResults[event.SequenceNum] = recordedTime
+					}
+				}
+			}
+		}
+	}
 
 	// Load signal results for replay - store raw JSON, will be deserialized on demand
 	signalResults := make(map[string]interface{})
@@ -438,6 +469,7 @@ func (w *Worker) executeWorkflow(
 		activityResults,
 		activityErrors,
 		timerResults,
+		timeResults,
 		signalResults,
 	)
 

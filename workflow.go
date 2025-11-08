@@ -24,10 +24,10 @@ type Workflow[In, Out any] struct {
 // WorkflowRegistryEntry stores both the workflow definition and a factory function
 // to create properly typed contexts without reflection.
 type WorkflowRegistryEntry struct {
-	workflow       interface{}                                                                                                                                                                                    // *Workflow[In, Out]
-	inputType      registry.TypeInfo                                                                                                                                                                              // Type information for input
-	outputType     registry.TypeInfo                                                                                                                                                                              // Type information for output
-	contextFactory func(context.Context, uuid.UUID, uuid.UUID, interface{}, int, string, *storage.Store, func() error, map[int]interface{}, map[int]error, map[int]time.Time, map[string]interface{}) interface{} // Factory to create Context[In]
+	workflow       interface{}                                                                                                                                                                                                       // *Workflow[In, Out]
+	inputType      registry.TypeInfo                                                                                                                                                                                                 // Type information for input
+	outputType     registry.TypeInfo                                                                                                                                                                                                 // Type information for output
+	contextFactory func(context.Context, uuid.UUID, uuid.UUID, interface{}, int, string, *storage.Store, func() error, map[int]interface{}, map[int]error, map[int]time.Time, map[int]time.Time, map[string]interface{}) interface{} // Factory to create Context[In]
 }
 
 // WorkflowRegistry stores registered workflows for execution.
@@ -66,6 +66,7 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 		activityResults map[int]interface{},
 		activityErrors map[int]error,
 		timerResults map[int]time.Time,
+		timeResults map[int]time.Time,
 		signalResults map[string]interface{},
 	) interface{} {
 		// Cast input to the correct type
@@ -91,6 +92,7 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 			activityResults: activityResults,
 			activityErrors:  activityErrors,
 			timerResults:    timerResults,
+			timeResults:     timeResults,
 			signalResults:   signalResults,
 			rnd:             rnd,
 			pauseFunc:       pauseFunc,
@@ -147,6 +149,7 @@ type Context[T any] struct {
 	activityResults map[int]interface{}
 	activityErrors  map[int]error
 	timerResults    map[int]time.Time
+	timeResults     map[int]time.Time // Recorded times for deterministic Time() calls
 	signalResults   map[string]interface{}
 
 	// Deterministic random
@@ -177,6 +180,7 @@ func newContext[T any](
 		sequenceNum:     sequenceNum,
 		activityResults: make(map[int]interface{}),
 		timerResults:    make(map[int]time.Time),
+		timeResults:     make(map[int]time.Time),
 		signalResults:   make(map[string]interface{}),
 		rnd:             rnd,
 		pauseFunc:       pauseFunc,
@@ -345,13 +349,81 @@ func (c *Context[T]) Random() *rand.Rand {
 	return c.rnd
 }
 
-// UUIDv7 generates a deterministic UUID based on workflow ID and sequence.
-func (c *Context[T]) UUIDv7() uuid.UUID {
+// Time returns the current time deterministically.
+// During replay, returns the recorded time from the first execution.
+// During first execution, records the current time in workflow history.
+func (c *Context[T]) Time() time.Time {
 	c.sequenceNum++
+	currentSeq := c.sequenceNum
 
-	// Generate deterministic UUID using workflow ID and sequence as seed
-	seed := c.workflowID.String() + string(rune(c.sequenceNum))
-	return uuid.NewSHA1(c.workflowID, []byte(seed))
+	// Check if we have a cached time (replay)
+	if recordedTime, ok := c.timeResults[currentSeq]; ok {
+		return recordedTime
+	}
+
+	// First execution - record current time
+	now := time.Now()
+
+	// Create history event to record the time
+	eventData, _ := json.Marshal(map[string]interface{}{
+		"recorded_time": now,
+	})
+
+	eventID := uuid.New()
+	historyEvent := &storage.HistoryEventModel{
+		ID:          storage.UUIDToPgtype(eventID),
+		TenantID:    storage.UUIDToPgtype(c.tenantID),
+		WorkflowID:  storage.UUIDToPgtype(c.workflowID),
+		SequenceNum: currentSeq,
+		EventType:   string(EventTimeRecorded),
+		EventData:   eventData,
+	}
+
+	if err := c.store.CreateHistoryEvent(c.ctx, historyEvent, nil); err != nil {
+		// If we can't record the time, fall back to using the current time
+		// This maintains workflow progress even if history recording fails
+		return now
+	}
+
+	// Cache for current execution
+	c.timeResults[currentSeq] = now
+
+	return now
+}
+
+// UUIDv7 generates a deterministic time-ordered UUID based on recorded time.
+// Uses the Time() primitive to ensure deterministic timestamps during replay.
+func (c *Context[T]) UUIDv7() uuid.UUID {
+	// Get deterministic time - this will increment sequence internally
+	recordedTime := c.Time()
+
+	// Extract timestamp in milliseconds for UUID v7
+	unixMs := recordedTime.UnixMilli()
+
+	// Create UUID v7 with deterministic timestamp and random bits from workflow's RNG
+	// UUID v7 format: 48 bits timestamp + 12 bits version/variant + 62 bits random
+	var uuidBytes [16]byte
+
+	// 48-bit timestamp (milliseconds since epoch)
+	uuidBytes[0] = byte(unixMs >> 40)
+	uuidBytes[1] = byte(unixMs >> 32)
+	uuidBytes[2] = byte(unixMs >> 24)
+	uuidBytes[3] = byte(unixMs >> 16)
+	uuidBytes[4] = byte(unixMs >> 8)
+	uuidBytes[5] = byte(unixMs)
+
+	// Fill remaining bytes with deterministic random data
+	for i := 6; i < 16; i++ {
+		uuidBytes[i] = byte(c.rnd.Int31n(256))
+	}
+
+	// Set version (7) in bits 48-51
+	uuidBytes[6] = (uuidBytes[6] & 0x0f) | 0x70
+
+	// Set variant (10) in bits 64-65
+	uuidBytes[8] = (uuidBytes[8] & 0x3f) | 0x80
+
+	return uuid.UUID(uuidBytes)
 }
 
 // WaitForSignal waits for an external signal with the given name.
@@ -424,6 +496,11 @@ func (c *Context[T]) SetActivityResult(seq int, result interface{}) {
 // SetTimerResult marks a timer as fired (used during replay).
 func (c *Context[T]) SetTimerResult(seq int, firedAt time.Time) {
 	c.timerResults[seq] = firedAt
+}
+
+// SetTimeResult sets a recorded time (used during replay).
+func (c *Context[T]) SetTimeResult(seq int, recordedTime time.Time) {
+	c.timeResults[seq] = recordedTime
 }
 
 // SetSignalResult sets a cached signal payload (used during replay).

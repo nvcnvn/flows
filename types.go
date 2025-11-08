@@ -61,6 +61,7 @@ const (
 	EventTimerFired        EventType = "TIMER_FIRED"
 	EventSignalReceived    EventType = "SIGNAL_RECEIVED"
 	EventSignalConsumed    EventType = "SIGNAL_CONSUMED"
+	EventTimeRecorded      EventType = "TIME_RECORDED"
 )
 
 // Error definitions
