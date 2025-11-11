@@ -37,13 +37,34 @@ func (s *Store) EnqueueTask(ctx context.Context, task *TaskQueueModel, tx interf
 }
 
 // DequeueTask claims a task from the queue using SELECT FOR UPDATE SKIP LOCKED.
+// In Citus, FOR UPDATE requires an equality filter on the distribution column.
+// We try each workflow_name separately to ensure single-shard queries.
 func (s *Store) DequeueTask(ctx context.Context, tenantID pgtype.UUID, workflowNames []string, visibilityTimeout time.Duration) (*TaskQueueModel, error) {
+	// Try each workflow name separately for Citus compatibility
+	// This ensures each query targets a single shard
+	for _, workflowName := range workflowNames {
+		task, err := s.tryDequeueTaskForWorkflow(ctx, tenantID, workflowName, visibilityTimeout)
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			return task, nil
+		}
+	}
+
+	// No tasks found in any workflow
+	return nil, nil
+}
+
+// tryDequeueTaskForWorkflow attempts to dequeue a task for a specific workflow name.
+// This uses equality on workflow_name for Citus single-shard routing with FOR UPDATE.
+func (s *Store) tryDequeueTaskForWorkflow(ctx context.Context, tenantID pgtype.UUID, workflowName string, visibilityTimeout time.Duration) (*TaskQueueModel, error) {
 	query := `
 		SELECT id, tenant_id, workflow_id, workflow_name, task_type, 
 		       task_data, visibility_timeout
 		FROM task_queue
-		WHERE tenant_id = $1 
-		  AND workflow_name = ANY($2)
+		WHERE workflow_name = $1
+		  AND tenant_id = $2
 		  AND visibility_timeout < NOW()
 		ORDER BY id ASC
 		LIMIT 1
@@ -56,13 +77,13 @@ func (s *Store) DequeueTask(ctx context.Context, tenantID pgtype.UUID, workflowN
 	}
 	defer func() {
 		rollbackErr := tx.Rollback(ctx)
-		if err == nil {
-			slog.Error("DequeueTask Rollback error", "error", rollbackErr)
+		if err == nil && rollbackErr != nil {
+			slog.Error("tryDequeueTaskForWorkflow Rollback error", "error", rollbackErr)
 		}
 	}()
 
 	task := &TaskQueueModel{}
-	err = tx.QueryRow(ctx, query, tenantID, workflowNames).Scan(
+	err = tx.QueryRow(ctx, query, workflowName, tenantID).Scan(
 		&task.ID, &task.TenantID, &task.WorkflowID, &task.WorkflowName,
 		&task.TaskType, &task.TaskData, &task.VisibilityTimeout,
 	)
@@ -78,10 +99,10 @@ func (s *Store) DequeueTask(ctx context.Context, tenantID pgtype.UUID, workflowN
 	updateQuery := `
 		UPDATE task_queue 
 		SET visibility_timeout = $1
-		WHERE id = $2
+		WHERE workflow_name = $2 AND id = $3
 	`
 	newTimeout := time.Now().Add(visibilityTimeout)
-	_, err = tx.Exec(ctx, updateQuery, newTimeout, task.ID)
+	_, err = tx.Exec(ctx, updateQuery, newTimeout, task.WorkflowName, task.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -95,13 +116,14 @@ func (s *Store) DequeueTask(ctx context.Context, tenantID pgtype.UUID, workflowN
 }
 
 // DeleteTask removes a task from the queue after successful processing.
-func (s *Store) DeleteTask(ctx context.Context, tenantID, taskID pgtype.UUID) error {
+// workflow_name must be provided first for efficient shard routing in Citus.
+func (s *Store) DeleteTask(ctx context.Context, workflowName string, tenantID, taskID pgtype.UUID) error {
 	query := `
 		DELETE FROM task_queue
-		WHERE tenant_id = $1 AND id = $2
+		WHERE workflow_name = $1 AND tenant_id = $2 AND id = $3
 	`
 
-	_, err := s.pool.Exec(ctx, query, tenantID, taskID)
+	_, err := s.pool.Exec(ctx, query, workflowName, tenantID, taskID)
 	return err
 }
 

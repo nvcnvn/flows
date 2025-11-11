@@ -1,7 +1,10 @@
 -- Flows Database Schema
--- PostgreSQL 17+ required for UUIDv7 support
+-- PostgreSQL 17+ with Citus extension for horizontal sharding
+-- Sharding Strategy: workflow_name (workflow type with shard suffix)
+-- Distribution: Consistent hashing allows adding shards dynamically (starts with 3 shards)
+-- Example workflow names: "loan-application-shard-0", "loan-application-shard-1", "loan-application-shard-2"
 
--- Enable pgcrypto for gen_random_bytes
+-- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Create UUIDv7 function (time-ordered UUIDs)
@@ -34,99 +37,133 @@ END;
 $$;
 
 -- Workflows: Main workflow state
+-- Distribution column: name (workflow type with shard suffix, e.g., "loan-application-shard-0")
 CREATE TABLE IF NOT EXISTS workflows (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+    name            TEXT NOT NULL,              -- Distribution column (shard key)
+    id              UUID NOT NULL DEFAULT gen_random_uuid_v7(),
     tenant_id       UUID NOT NULL,
-    name            TEXT NOT NULL,
     version         INT NOT NULL,
-    status          TEXT NOT NULL,  -- pending, running, completed, failed
+    status          TEXT NOT NULL,              -- pending, running, completed, failed
     input           JSONB,
     output          JSONB,
     error           TEXT,
     sequence_num    INT DEFAULT 0,
-    activity_results JSONB DEFAULT '{}'::jsonb,  -- Cache for replay
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    activity_results JSONB DEFAULT '{}'::jsonb,
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (name, id)                      -- Citus requires distribution column in PK
 );
-CREATE INDEX IF NOT EXISTS idx_workflows_tenant_status ON workflows(tenant_id, status);
-CREATE INDEX IF NOT EXISTS idx_workflows_tenant_name ON workflows(tenant_id, name);
+
+-- Indexes: distribution column must be first for local shard routing
+CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(name, status);
+CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(name, tenant_id);
+CREATE INDEX IF NOT EXISTS idx_workflows_updated ON workflows(name, updated_at);
 
 -- Activities: Activity execution state
+-- Distribution column: workflow_name (co-located with workflows)
 CREATE TABLE IF NOT EXISTS activities (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+    workflow_name   TEXT NOT NULL,              -- Distribution column
+    workflow_id     UUID NOT NULL,
+    id              UUID NOT NULL DEFAULT gen_random_uuid_v7(),
     tenant_id       UUID NOT NULL,
-    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    name            TEXT NOT NULL,
+    name            TEXT NOT NULL,              -- Activity name
     sequence_num    INT NOT NULL,
-    status          TEXT NOT NULL,  -- scheduled, running, completed, failed
+    status          TEXT NOT NULL,              -- scheduled, running, completed, failed
     input           JSONB,
     output          JSONB,
     error           TEXT,
     attempt         INT DEFAULT 0,
     next_retry_at   TIMESTAMPTZ,
     backoff_ms      BIGINT,
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (workflow_name, workflow_id, id),
+    FOREIGN KEY (workflow_name, workflow_id) REFERENCES workflows(name, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_activities_workflow ON activities(tenant_id, workflow_id, sequence_num);
-CREATE INDEX IF NOT EXISTS idx_activities_retry ON activities(tenant_id, status, next_retry_at) WHERE status = 'scheduled';
+
+-- Indexes: distribution column first
+CREATE INDEX IF NOT EXISTS idx_activities_workflow ON activities(workflow_name, workflow_id, sequence_num);
+CREATE INDEX IF NOT EXISTS idx_activities_retry ON activities(workflow_name, status, next_retry_at) WHERE status = 'scheduled';
 
 -- History Events: Audit log
+-- Distribution column: workflow_name (co-located with workflows)
 CREATE TABLE IF NOT EXISTS history_events (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+    workflow_name   TEXT NOT NULL,              -- Distribution column
+    workflow_id     UUID NOT NULL,
+    id              UUID NOT NULL DEFAULT gen_random_uuid_v7(),
     tenant_id       UUID NOT NULL,
-    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     sequence_num    INT NOT NULL,
-    event_type      TEXT NOT NULL,  -- WORKFLOW_STARTED, ACTIVITY_SCHEDULED, ACTIVITY_COMPLETED, etc.
-    event_data      JSONB
+    event_type      TEXT NOT NULL,
+    event_data      JSONB,
+    PRIMARY KEY (workflow_name, workflow_id, id),
+    FOREIGN KEY (workflow_name, workflow_id) REFERENCES workflows(name, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_history_workflow ON history_events(tenant_id, workflow_id, sequence_num);
+
+CREATE INDEX IF NOT EXISTS idx_history_workflow ON history_events(workflow_name, workflow_id, sequence_num);
 
 -- Timers: Sleep operations
+-- Distribution column: workflow_name (co-located with workflows)
 CREATE TABLE IF NOT EXISTS timers (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+    workflow_name   TEXT NOT NULL,              -- Distribution column
+    workflow_id     UUID NOT NULL,
+    id              UUID NOT NULL DEFAULT gen_random_uuid_v7(),
     tenant_id       UUID NOT NULL,
-    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     sequence_num    INT NOT NULL,
     fire_at         TIMESTAMPTZ NOT NULL,
-    fired           BOOLEAN DEFAULT FALSE
+    fired           BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (workflow_name, workflow_id, id),
+    FOREIGN KEY (workflow_name, workflow_id) REFERENCES workflows(name, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_timers_fire ON timers(tenant_id, fire_at) WHERE NOT fired;
-CREATE INDEX IF NOT EXISTS idx_timers_workflow ON timers(tenant_id, workflow_id, sequence_num);
+
+CREATE INDEX IF NOT EXISTS idx_timers_fire ON timers(workflow_name, fire_at) WHERE NOT fired;
+CREATE INDEX IF NOT EXISTS idx_timers_workflow ON timers(workflow_name, workflow_id, sequence_num);
 
 -- Signals: External events
+-- Distribution column: workflow_name (co-located with workflows)
 CREATE TABLE IF NOT EXISTS signals (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+    workflow_name   TEXT NOT NULL,              -- Distribution column
+    workflow_id     UUID NOT NULL,
+    id              UUID NOT NULL DEFAULT gen_random_uuid_v7(),
     tenant_id       UUID NOT NULL,
-    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     signal_name     TEXT NOT NULL,
     payload         JSONB,
-    consumed        BOOLEAN DEFAULT FALSE
+    consumed        BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (workflow_name, workflow_id, id),
+    FOREIGN KEY (workflow_name, workflow_id) REFERENCES workflows(name, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_signals_workflow ON signals(tenant_id, workflow_id, signal_name) WHERE NOT consumed;
+
+CREATE INDEX IF NOT EXISTS idx_signals_workflow ON signals(workflow_name, workflow_id, signal_name) WHERE NOT consumed;
 
 -- Task Queue: Distributed work queue
+-- Distribution column: workflow_name (for efficient worker polling)
 CREATE TABLE IF NOT EXISTS task_queue (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+    workflow_name       TEXT NOT NULL,          -- Distribution column
+    id                  UUID NOT NULL DEFAULT gen_random_uuid_v7(),
+    workflow_id         UUID NOT NULL,
     tenant_id           UUID NOT NULL,
-    workflow_id         UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    workflow_name       TEXT NOT NULL,  -- For worker type filtering
-    task_type           TEXT NOT NULL,  -- workflow, activity, timer
-    task_data           JSONB,          -- Additional task-specific data
-    visibility_timeout  TIMESTAMPTZ NOT NULL
+    task_type           TEXT NOT NULL,          -- workflow, activity, timer
+    task_data           JSONB,
+    visibility_timeout  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (workflow_name, id),
+    FOREIGN KEY (workflow_name, workflow_id) REFERENCES workflows(name, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_task_queue_poll ON task_queue(tenant_id, workflow_name, visibility_timeout);
+
+-- Index for efficient polling: distribution column first
+CREATE INDEX IF NOT EXISTS idx_task_queue_poll ON task_queue(workflow_name, visibility_timeout, id);
 
 -- Dead Letter Queue: Failed tasks
+-- Distribution column: workflow_name
 CREATE TABLE IF NOT EXISTS dead_letter_queue (
-    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
-    tenant_id               UUID NOT NULL,
+    workflow_name           TEXT NOT NULL,      -- Distribution column
+    id                      UUID NOT NULL DEFAULT gen_random_uuid_v7(),
     workflow_id             UUID NOT NULL,
-    workflow_name           TEXT NOT NULL,
+    tenant_id               UUID NOT NULL,
     workflow_version        INT NOT NULL,
     input                   JSONB,
     error                   TEXT,
     attempt                 INT,
-    metadata                JSONB,  -- {dlq_id, original_workflow_id, attempt}
-    rerun_as_workflow_id    UUID    -- Set when rerun from DLQ
+    metadata                JSONB,
+    rerun_as_workflow_id    UUID,
+    PRIMARY KEY (workflow_name, id)
 );
-CREATE INDEX IF NOT EXISTS idx_dlq_tenant ON dead_letter_queue(tenant_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_dlq_workflow ON dead_letter_queue(tenant_id, workflow_id);
+
+CREATE INDEX IF NOT EXISTS idx_dlq_workflow ON dead_letter_queue(workflow_name, workflow_id);
+CREATE INDEX IF NOT EXISTS idx_dlq_tenant ON dead_letter_queue(workflow_name, tenant_id);

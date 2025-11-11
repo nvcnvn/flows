@@ -234,7 +234,7 @@ func TestTimeTrackingWorkflow_Complete(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Query status - should be sleeping
-	status, err := flows.Query(ctx, exec.WorkflowID())
+	status, err := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
 	require.NoError(t, err, "Failed to query workflow")
 	t.Logf("Workflow status (should be sleeping): %+v", status)
 
@@ -242,12 +242,12 @@ func TestTimeTrackingWorkflow_Complete(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// Query status again - should be waiting for signal
-	status, err = flows.Query(ctx, exec.WorkflowID())
+	status, err = flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
 	require.NoError(t, err, "Failed to query workflow")
 	t.Logf("Workflow status (waiting for signal): %+v", status)
 
 	// Send approval signal
-	err = flows.SendSignal(ctx, exec.WorkflowID(), "approval", &ApprovalSignal{
+	err = flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "approval", &ApprovalSignal{
 		Approved:   true,
 		ApproverID: "manager-123",
 	})
@@ -364,7 +364,7 @@ func TestTimeTrackingWorkflow_Rejection(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// Send rejection signal
-	err = flows.SendSignal(ctx, exec.WorkflowID(), "approval", &ApprovalSignal{
+	err = flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "approval", &ApprovalSignal{
 		Approved:   false,
 		ApproverID: "manager-456",
 	})
@@ -443,7 +443,7 @@ func TestTimeTrackingWorkflow_Determinism(t *testing.T) {
 
 	// Wait and send approval
 	time.Sleep(3 * time.Second)
-	err = flows.SendSignal(ctx, exec.WorkflowID(), "approval", &ApprovalSignal{
+	err = flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "approval", &ApprovalSignal{
 		Approved:   true,
 		ApproverID: "manager-789",
 	})

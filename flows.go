@@ -86,11 +86,14 @@ func startInternal[In, Out any](
 
 	workflowID := uuid.New()
 
+	// Get sharded workflow name using consistent hashing
+	shardedName := GetShardedWorkflowName(wf.Name(), workflowID)
+
 	// Create workflow model
 	wfModel := &storage.WorkflowModel{
 		ID:              storage.UUIDToPgtype(workflowID),
 		TenantID:        storage.UUIDToPgtype(tenantID),
-		Name:            wf.Name(),
+		Name:            shardedName, // Use sharded name
 		Version:         wf.Version(),
 		Status:          string(StatusPending),
 		Input:           inputData,
@@ -104,7 +107,7 @@ func startInternal[In, Out any](
 		ID:                storage.UUIDToPgtype(taskID),
 		TenantID:          storage.UUIDToPgtype(tenantID),
 		WorkflowID:        storage.UUIDToPgtype(workflowID),
-		WorkflowName:      wf.Name(),
+		WorkflowName:      shardedName, // Use sharded name
 		TaskType:          string(TaskTypeWorkflow),
 		VisibilityTimeout: time.Now(),
 	}
@@ -124,9 +127,10 @@ func startInternal[In, Out any](
 	}
 
 	return &Execution[Out]{
-		id:         taskID,
-		workflowID: workflowID,
-		store:      store,
+		id:           taskID,
+		workflowID:   workflowID,
+		workflowName: shardedName,
+		store:        store,
 	}, nil
 }
 
@@ -135,6 +139,7 @@ func sendSignalInternal[P any](
 	store *storage.Store,
 	ctx context.Context,
 	workflowID uuid.UUID,
+	workflowName string,
 	signalName string,
 	payload *P,
 	opts ...SignalOption,
@@ -149,18 +154,13 @@ func sendSignalInternal[P any](
 	}
 
 	signalModel := &storage.SignalModel{
-		ID:         storage.UUIDToPgtype(uuid.New()),
-		TenantID:   storage.UUIDToPgtype(tenantID),
-		WorkflowID: storage.UUIDToPgtype(workflowID),
-		SignalName: signalName,
-		Payload:    payloadData,
-		Consumed:   false,
-	}
-
-	// Get workflow info to enqueue task
-	wf, err := store.GetWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
-	if err != nil {
-		return fmt.Errorf("failed to get workflow: %w", err)
+		WorkflowName: workflowName,
+		ID:           storage.UUIDToPgtype(uuid.New()),
+		TenantID:     storage.UUIDToPgtype(tenantID),
+		WorkflowID:   storage.UUIDToPgtype(workflowID),
+		SignalName:   signalName,
+		Payload:      payloadData,
+		Consumed:     false,
 	}
 
 	// Create workflow task to resume execution
@@ -168,25 +168,37 @@ func sendSignalInternal[P any](
 		ID:                storage.UUIDToPgtype(uuid.New()),
 		TenantID:          storage.UUIDToPgtype(tenantID),
 		WorkflowID:        storage.UUIDToPgtype(workflowID),
-		WorkflowName:      wf.Name,
+		WorkflowName:      workflowName,
 		TaskType:          string(TaskTypeWorkflow),
 		VisibilityTimeout: time.Now(),
 	}
 
 	// Execute within transaction
 	return executeInTx(ctx, store, cfg.tx, func(tx Tx) error {
-		if err := store.CreateSignal(ctx, signalModel, tx); err != nil {
-			return err
+		// Verify workflow exists and belongs to the correct tenant
+		// This ensures cross-tenant signal attempts are rejected
+		_, err := store.GetWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+		if err != nil {
+			return fmt.Errorf("failed to get workflow: %w", err)
 		}
-		return store.EnqueueTask(ctx, taskModel, tx)
+
+		if err := store.CreateSignal(ctx, signalModel, tx); err != nil {
+			return fmt.Errorf("failed to create signal: %w", err)
+		}
+		if err := store.EnqueueTask(ctx, taskModel, tx); err != nil {
+			return fmt.Errorf("failed to enqueue task: %w", err)
+		}
+		return nil
 	})
 }
 
 // Query retrieves the current status of a workflow.
-func (eng *Engine) Query(ctx context.Context, workflowID uuid.UUID) (*WorkflowInfo, error) {
+// Requires workflow name for efficient single-shard routing.
+func (eng *Engine) Query(ctx context.Context, workflowID uuid.UUID, workflowName string) (*WorkflowInfo, error) {
 	tenantID := MustGetTenantID(ctx)
 
-	wf, err := eng.store.GetWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	// Use efficient single-shard query with workflow_name
+	wf, err := eng.store.GetWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return nil, err
 	}
@@ -202,16 +214,18 @@ func (eng *Engine) Query(ctx context.Context, workflowID uuid.UUID) (*WorkflowIn
 }
 
 // RerunFromDLQ creates a new workflow execution from a DLQ entry.
+// Requires workflow name for efficient single-shard routing.
 func (eng *Engine) RerunFromDLQ(
 	ctx context.Context,
 	dlqID uuid.UUID,
+	workflowName string,
 	opts ...RerunOption,
 ) (uuid.UUID, error) {
 	cfg := getRerunConfig(opts)
 	tenantID := MustGetTenantID(ctx)
 
-	// Get DLQ entry
-	dlqEntry, err := eng.store.GetDLQEntry(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID))
+	// Get DLQ entry using workflow_name for single-shard query
+	dlqEntry, err := eng.store.GetDLQEntry(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID))
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to get DLQ entry: %w", err)
 	}
@@ -259,7 +273,7 @@ func (eng *Engine) RerunFromDLQ(
 		if err := eng.store.EnqueueTask(ctx, taskModel, tx); err != nil {
 			return fmt.Errorf("failed to enqueue task: %w", err)
 		}
-		if err := eng.store.UpdateDLQRerun(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID), storage.UUIDToPgtype(newWorkflowID)); err != nil {
+		if err := eng.store.UpdateDLQRerun(ctx, dlqEntry.WorkflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID), storage.UUIDToPgtype(newWorkflowID)); err != nil {
 			return fmt.Errorf("failed to update DLQ: %w", err)
 		}
 		return nil
@@ -306,9 +320,15 @@ func Start[In, Out any](
 }
 
 // SendSignal sends a signal using the global engine.
+// Requires workflow name for efficient single-shard routing.
+// Get workflow name from the Execution returned by Start():
+//
+//	exec, _ := flows.Start(ctx, myWorkflow, input)
+//	flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "my-signal", payload)
 func SendSignal[P any](
 	ctx context.Context,
 	workflowID uuid.UUID,
+	workflowName string,
 	signalName string,
 	payload *P,
 	opts ...SignalOption,
@@ -317,23 +337,30 @@ func SendSignal[P any](
 	if engine == nil {
 		return fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return sendSignalInternal(engine.store, ctx, workflowID, signalName, payload, opts...)
+	return sendSignalInternal(engine.store, ctx, workflowID, workflowName, signalName, payload, opts...)
 }
 
 // Query queries workflow status using the global engine.
-func Query(ctx context.Context, workflowID uuid.UUID) (*WorkflowInfo, error) {
+// Requires workflow name for efficient single-shard routing.
+// Get workflow name from the Execution returned by Start():
+//
+//	exec, _ := flows.Start(ctx, myWorkflow, input)
+//	info, _ := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
+func Query(ctx context.Context, workflowID uuid.UUID, workflowName string) (*WorkflowInfo, error) {
 	engine := getGlobalEngine()
 	if engine == nil {
 		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return engine.Query(ctx, workflowID)
+	return engine.Query(ctx, workflowID, workflowName)
 }
 
 // RerunFromDLQ reruns from DLQ using the global engine.
-func RerunFromDLQ(ctx context.Context, dlqID uuid.UUID, opts ...RerunOption) (uuid.UUID, error) {
+// Requires workflow name for efficient single-shard routing.
+// Get workflow name from listing DLQ entries (e.g., via a ListDLQ function).
+func RerunFromDLQ(ctx context.Context, dlqID uuid.UUID, workflowName string, opts ...RerunOption) (uuid.UUID, error) {
 	engine := getGlobalEngine()
 	if engine == nil {
 		return uuid.Nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return engine.RerunFromDLQ(ctx, dlqID, opts...)
+	return engine.RerunFromDLQ(ctx, dlqID, workflowName, opts...)
 }

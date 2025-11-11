@@ -23,7 +23,3 @@
 ```bash
 go get github.com/nvcnvn/flows
 ```
-
-**Requirements**: PostgreSQL 18+ (for UUIDv7 support)
-
-### Tutorial

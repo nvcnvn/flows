@@ -12,23 +12,23 @@ import (
 func (s *Store) CreateActivity(ctx context.Context, act *ActivityModel, tx interface{}) error {
 	query := `
 		INSERT INTO activities (
-			id, tenant_id, workflow_id, name, sequence_num, status, 
+			workflow_name, id, tenant_id, workflow_id, name, sequence_num, status, 
 			input, output, error, attempt, next_retry_at, backoff_ms
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 
 	var err error
 	if tx != nil {
 		if pgxTx, ok := tx.(pgx.Tx); ok {
 			_, err = pgxTx.Exec(ctx, query,
-				act.ID, act.TenantID, act.WorkflowID, act.Name, act.SequenceNum,
+				act.WorkflowName, act.ID, act.TenantID, act.WorkflowID, act.Name, act.SequenceNum,
 				act.Status, act.Input, act.Output, act.Error, act.Attempt,
 				act.NextRetryAt, act.BackoffMs,
 			)
 		}
 	} else {
 		_, err = s.pool.Exec(ctx, query,
-			act.ID, act.TenantID, act.WorkflowID, act.Name, act.SequenceNum,
+			act.WorkflowName, act.ID, act.TenantID, act.WorkflowID, act.Name, act.SequenceNum,
 			act.Status, act.Input, act.Output, act.Error, act.Attempt,
 			act.NextRetryAt, act.BackoffMs,
 		)
@@ -38,17 +38,18 @@ func (s *Store) CreateActivity(ctx context.Context, act *ActivityModel, tx inter
 }
 
 // GetActivity retrieves an activity by ID.
-func (s *Store) GetActivity(ctx context.Context, tenantID, activityID pgtype.UUID) (*ActivityModel, error) {
+// workflow_name must be provided first for efficient shard routing in Citus.
+func (s *Store) GetActivity(ctx context.Context, workflowName string, tenantID, activityID pgtype.UUID) (*ActivityModel, error) {
 	query := `
-		SELECT id, tenant_id, workflow_id, name, sequence_num, status, 
+		SELECT workflow_name, id, tenant_id, workflow_id, name, sequence_num, status, 
 		       input, output, error, attempt, next_retry_at, backoff_ms, updated_at
 		FROM activities
-		WHERE tenant_id = $1 AND id = $2
+		WHERE workflow_name = $1 AND tenant_id = $2 AND id = $3
 	`
 
 	act := &ActivityModel{}
-	err := s.pool.QueryRow(ctx, query, tenantID, activityID).Scan(
-		&act.ID, &act.TenantID, &act.WorkflowID, &act.Name, &act.SequenceNum,
+	err := s.pool.QueryRow(ctx, query, workflowName, tenantID, activityID).Scan(
+		&act.WorkflowName, &act.ID, &act.TenantID, &act.WorkflowID, &act.Name, &act.SequenceNum,
 		&act.Status, &act.Input, &act.Output, &act.Error, &act.Attempt,
 		&act.NextRetryAt, &act.BackoffMs, &act.UpdatedAt,
 	)
@@ -64,57 +65,61 @@ func (s *Store) GetActivity(ctx context.Context, tenantID, activityID pgtype.UUI
 }
 
 // UpdateActivityStatus updates the activity status.
-func (s *Store) UpdateActivityStatus(ctx context.Context, tenantID, activityID pgtype.UUID, status string) error {
+// workflow_name must be provided first for efficient shard routing in Citus.
+func (s *Store) UpdateActivityStatus(ctx context.Context, workflowName string, tenantID, activityID pgtype.UUID, status string) error {
 	query := `
 		UPDATE activities
 		SET status = $1, updated_at = NOW()
-		WHERE tenant_id = $2 AND id = $3
+		WHERE workflow_name = $2 AND tenant_id = $3 AND id = $4
 	`
 
-	_, err := s.pool.Exec(ctx, query, status, tenantID, activityID)
+	_, err := s.pool.Exec(ctx, query, status, workflowName, tenantID, activityID)
 	return err
 }
 
 // UpdateActivityComplete marks activity as completed with output.
-func (s *Store) UpdateActivityComplete(ctx context.Context, tenantID, activityID pgtype.UUID, output json.RawMessage) error {
+// workflow_name must be provided first for efficient shard routing in Citus.
+func (s *Store) UpdateActivityComplete(ctx context.Context, workflowName string, tenantID, activityID pgtype.UUID, output json.RawMessage) error {
 	query := `
 		UPDATE activities
 		SET status = 'completed', output = $1, updated_at = NOW()
-		WHERE tenant_id = $2 AND id = $3
+		WHERE workflow_name = $2 AND tenant_id = $3 AND id = $4
 	`
 
-	_, err := s.pool.Exec(ctx, query, output, tenantID, activityID)
+	_, err := s.pool.Exec(ctx, query, output, workflowName, tenantID, activityID)
 	return err
 }
 
 // UpdateActivityFailed marks activity as failed with error and retry info.
+// workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) UpdateActivityFailed(ctx context.Context, act *ActivityModel) error {
 	query := `
 		UPDATE activities
 		SET status = $1, error = $2, attempt = $3, 
 		    next_retry_at = $4, backoff_ms = $5, updated_at = NOW()
-		WHERE tenant_id = $6 AND id = $7
+		WHERE workflow_name = $6 AND tenant_id = $7 AND id = $8
 	`
 
 	_, err := s.pool.Exec(ctx, query,
 		act.Status, act.Error, act.Attempt,
 		act.NextRetryAt, act.BackoffMs,
-		act.TenantID, act.ID,
+		act.WorkflowName, act.TenantID, act.ID,
 	)
 	return err
 }
 
 // GetActivitiesByWorkflow retrieves all activities for a workflow.
-func (s *Store) GetActivitiesByWorkflow(ctx context.Context, tenantID, workflowID pgtype.UUID) ([]*ActivityModel, error) {
+// workflow_name must be provided first for efficient shard routing in Citus.
+func (s *Store) GetActivitiesByWorkflow(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID) ([]*ActivityModel, error) {
 	query := `
-		SELECT id, tenant_id, workflow_id, name, sequence_num, status, 
+		SELECT workflow_name, id, tenant_id, workflow_id, name, sequence_num, status, 
 		       input, output, error, attempt, next_retry_at, backoff_ms, updated_at
 		FROM activities
-		WHERE tenant_id = $1 AND workflow_id = $2
+		WHERE workflow_name = $1 AND tenant_id = $2 AND workflow_id = $3
 		ORDER BY sequence_num ASC
 	`
 
-	rows, err := s.pool.Query(ctx, query, tenantID, workflowID)
+	rows, err := s.pool.Query(ctx, query, workflowName, tenantID, workflowID)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +129,7 @@ func (s *Store) GetActivitiesByWorkflow(ctx context.Context, tenantID, workflowI
 	for rows.Next() {
 		act := &ActivityModel{}
 		err := rows.Scan(
-			&act.ID, &act.TenantID, &act.WorkflowID, &act.Name, &act.SequenceNum,
+			&act.WorkflowName, &act.ID, &act.TenantID, &act.WorkflowID, &act.Name, &act.SequenceNum,
 			&act.Status, &act.Input, &act.Output, &act.Error, &act.Attempt,
 			&act.NextRetryAt, &act.BackoffMs, &act.UpdatedAt,
 		)

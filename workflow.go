@@ -230,14 +230,15 @@ func ExecuteActivity[T, In, Out any](c *Context[T], activity *Activity[In, Out],
 	// Create activity record
 	activityID := uuid.New()
 	actModel := &storage.ActivityModel{
-		ID:          storage.UUIDToPgtype(activityID),
-		TenantID:    storage.UUIDToPgtype(c.tenantID),
-		WorkflowID:  storage.UUIDToPgtype(c.workflowID),
-		Name:        activity.Name(),
-		SequenceNum: currentSeq,
-		Status:      string(ActivityStatusScheduled),
-		Input:       inputData,
-		Attempt:     0,
+		WorkflowName: c.workflowName, // Shard key
+		WorkflowID:   storage.UUIDToPgtype(c.workflowID),
+		ID:           storage.UUIDToPgtype(activityID),
+		TenantID:     storage.UUIDToPgtype(c.tenantID),
+		Name:         activity.Name(),
+		SequenceNum:  currentSeq,
+		Status:       string(ActivityStatusScheduled),
+		Input:        inputData,
+		Attempt:      0,
 	}
 
 	if err := c.store.CreateActivity(c.ctx, actModel, nil); err != nil {
@@ -291,12 +292,13 @@ func (c *Context[T]) Sleep(duration time.Duration) error {
 	fireAt := time.Now().Add(duration)
 
 	timerModel := &storage.TimerModel{
-		ID:          storage.UUIDToPgtype(timerID),
-		TenantID:    storage.UUIDToPgtype(c.tenantID),
-		WorkflowID:  storage.UUIDToPgtype(c.workflowID),
-		SequenceNum: currentSeq,
-		FireAt:      fireAt,
-		Fired:       false,
+		WorkflowName: c.workflowName,
+		ID:           storage.UUIDToPgtype(timerID),
+		TenantID:     storage.UUIDToPgtype(c.tenantID),
+		WorkflowID:   storage.UUIDToPgtype(c.workflowID),
+		SequenceNum:  currentSeq,
+		FireAt:       fireAt,
+		Fired:        false,
 	}
 
 	if err := c.store.CreateTimer(c.ctx, timerModel, nil); err != nil {
@@ -359,12 +361,13 @@ func (c *Context[T]) Random(numBytes int) ([]byte, error) {
 
 	eventID := uuid.New()
 	historyEvent := &storage.HistoryEventModel{
-		ID:          storage.UUIDToPgtype(eventID),
-		TenantID:    storage.UUIDToPgtype(c.tenantID),
-		WorkflowID:  storage.UUIDToPgtype(c.workflowID),
-		SequenceNum: currentSeq,
-		EventType:   string(EventRandomGenerated),
-		EventData:   eventData,
+		WorkflowName: c.workflowName,
+		ID:           storage.UUIDToPgtype(eventID),
+		TenantID:     storage.UUIDToPgtype(c.tenantID),
+		WorkflowID:   storage.UUIDToPgtype(c.workflowID),
+		SequenceNum:  currentSeq,
+		EventType:    string(EventRandomGenerated),
+		EventData:    eventData,
 	}
 
 	if err := c.store.CreateHistoryEvent(c.ctx, historyEvent, nil); err != nil {
@@ -466,12 +469,13 @@ func (c *Context[T]) Time() time.Time {
 
 	eventID := uuid.New()
 	historyEvent := &storage.HistoryEventModel{
-		ID:          storage.UUIDToPgtype(eventID),
-		TenantID:    storage.UUIDToPgtype(c.tenantID),
-		WorkflowID:  storage.UUIDToPgtype(c.workflowID),
-		SequenceNum: currentSeq,
-		EventType:   string(EventTimeRecorded),
-		EventData:   eventData,
+		WorkflowName: c.workflowName,
+		ID:           storage.UUIDToPgtype(eventID),
+		TenantID:     storage.UUIDToPgtype(c.tenantID),
+		WorkflowID:   storage.UUIDToPgtype(c.workflowID),
+		SequenceNum:  currentSeq,
+		EventType:    string(EventTimeRecorded),
+		EventData:    eventData,
 	}
 
 	if err := c.store.CreateHistoryEvent(c.ctx, historyEvent, nil); err != nil {
@@ -553,14 +557,14 @@ func WaitForSignal[T, P any](c *Context[T], signalName string) (*P, error) {
 	}
 
 	// Check if signal is available in database
-	signal, err := c.store.GetSignal(c.ctx, storage.UUIDToPgtype(c.tenantID), storage.UUIDToPgtype(c.workflowID), signalName)
+	signal, err := c.store.GetSignal(c.ctx, c.workflowName, storage.UUIDToPgtype(c.tenantID), storage.UUIDToPgtype(c.workflowID), signalName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check for signal: %w", err)
 	}
 
 	if signal != nil {
 		// Signal available - consume it and return payload
-		if err := c.store.ConsumeSignal(c.ctx, storage.UUIDToPgtype(c.tenantID), signal.ID); err != nil {
+		if err := c.store.ConsumeSignal(c.ctx, c.workflowName, storage.UUIDToPgtype(c.tenantID), signal.ID); err != nil {
 			return nil, fmt.Errorf("failed to consume signal: %w", err)
 		}
 
@@ -615,9 +619,10 @@ func (c *Context[T]) SetSignalResult(signalName string, payload interface{}) {
 
 // Execution represents a handle to a running workflow execution.
 type Execution[Out any] struct {
-	id         uuid.UUID
-	workflowID uuid.UUID
-	store      *storage.Store
+	id           uuid.UUID
+	workflowID   uuid.UUID
+	workflowName string
+	store        *storage.Store
 }
 
 // ID returns the execution ID.
@@ -628,6 +633,12 @@ func (e *Execution[Out]) ID() uuid.UUID {
 // WorkflowID returns the workflow ID.
 func (e *Execution[Out]) WorkflowID() uuid.UUID {
 	return e.workflowID
+}
+
+// WorkflowName returns the sharded workflow name.
+// Use this with SendSignal and Query for efficient single-shard queries.
+func (e *Execution[Out]) WorkflowName() string {
+	return e.workflowName
 }
 
 // Get waits for the workflow to complete and returns the result.
@@ -645,7 +656,7 @@ func (e *Execution[Out]) Get(ctx context.Context) (*Out, error) {
 			return nil, ctx.Err()
 		case <-ticker.C:
 			// Check workflow status
-			wf, err := e.store.GetWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(e.workflowID))
+			wf, err := e.store.GetWorkflow(ctx, e.workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(e.workflowID))
 			if err != nil {
 				return nil, err
 			}

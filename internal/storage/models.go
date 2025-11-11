@@ -41,49 +41,53 @@ type WorkflowModel struct {
 
 // ActivityModel represents an activity in the database.
 type ActivityModel struct {
-	ID          pgtype.UUID
-	TenantID    pgtype.UUID
-	WorkflowID  pgtype.UUID
-	Name        string
-	SequenceNum int
-	Status      string
-	Input       json.RawMessage
-	Output      json.RawMessage
-	Error       string
-	Attempt     int
-	NextRetryAt *time.Time
-	BackoffMs   int64
-	UpdatedAt   time.Time
+	WorkflowName string // Shard key
+	WorkflowID   pgtype.UUID
+	ID           pgtype.UUID
+	TenantID     pgtype.UUID
+	Name         string
+	SequenceNum  int
+	Status       string
+	Input        json.RawMessage
+	Output       json.RawMessage
+	Error        string
+	Attempt      int
+	NextRetryAt  *time.Time
+	BackoffMs    int64
+	UpdatedAt    time.Time
 }
 
 // HistoryEventModel represents a history event in the database.
 type HistoryEventModel struct {
-	ID          pgtype.UUID
-	TenantID    pgtype.UUID
-	WorkflowID  pgtype.UUID
-	SequenceNum int
-	EventType   string
-	EventData   json.RawMessage
+	WorkflowName string // Shard key
+	WorkflowID   pgtype.UUID
+	ID           pgtype.UUID
+	TenantID     pgtype.UUID
+	SequenceNum  int
+	EventType    string
+	EventData    json.RawMessage
 }
 
 // TimerModel represents a timer in the database.
 type TimerModel struct {
-	ID          pgtype.UUID
-	TenantID    pgtype.UUID
-	WorkflowID  pgtype.UUID
-	SequenceNum int
-	FireAt      time.Time
-	Fired       bool
+	WorkflowName string // Shard key
+	WorkflowID   pgtype.UUID
+	ID           pgtype.UUID
+	TenantID     pgtype.UUID
+	SequenceNum  int
+	FireAt       time.Time
+	Fired        bool
 }
 
 // SignalModel represents a signal in the database.
 type SignalModel struct {
-	ID         pgtype.UUID
-	TenantID   pgtype.UUID
-	WorkflowID pgtype.UUID
-	SignalName string
-	Payload    json.RawMessage
-	Consumed   bool
+	WorkflowName string // Shard key
+	WorkflowID   pgtype.UUID
+	ID           pgtype.UUID
+	TenantID     pgtype.UUID
+	SignalName   string
+	Payload      json.RawMessage
+	Consumed     bool
 }
 
 // TaskQueueModel represents a task in the queue.
@@ -99,10 +103,10 @@ type TaskQueueModel struct {
 
 // DLQModel represents a dead letter queue entry.
 type DLQModel struct {
+	WorkflowName      string // Shard key
 	ID                pgtype.UUID
-	TenantID          pgtype.UUID
 	WorkflowID        pgtype.UUID
-	WorkflowName      string
+	TenantID          pgtype.UUID
 	WorkflowVersion   int
 	Input             json.RawMessage
 	Error             string

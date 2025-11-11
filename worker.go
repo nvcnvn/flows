@@ -34,6 +34,8 @@ type WorkerConfig struct {
 }
 
 // NewWorker creates a new worker instance.
+// Automatically expands base workflow names to include all shards.
+// Example: ["loan-workflow"] -> ["loan-workflow-shard-0", "loan-workflow-shard-1", "loan-workflow-shard-2"]
 func NewWorker(pool *pgxpool.Pool, config WorkerConfig) *Worker {
 	// Set defaults
 	if config.Concurrency == 0 {
@@ -45,6 +47,14 @@ func NewWorker(pool *pgxpool.Pool, config WorkerConfig) *Worker {
 	if config.VisibilityTimeout == 0 {
 		config.VisibilityTimeout = 5 * time.Minute
 	}
+
+	// Expand workflow names to include all shards
+	var expandedNames []string
+	for _, baseName := range config.WorkflowNames {
+		shardedNames := GetAllShardedWorkflowNames(baseName)
+		expandedNames = append(expandedNames, shardedNames...)
+	}
+	config.WorkflowNames = expandedNames
 
 	return &Worker{
 		store:  storage.NewStore(pool),
@@ -162,7 +172,7 @@ func (w *Worker) pollAndProcess(ctx context.Context) error {
 	}
 
 	// Task completed - remove from queue
-	if err := w.store.DeleteTask(ctx, storage.UUIDToPgtype(w.config.TenantID), task.ID); err != nil {
+	if err := w.store.DeleteTask(ctx, task.WorkflowName, storage.UUIDToPgtype(w.config.TenantID), task.ID); err != nil {
 		// Don't report error if context was cancelled
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -181,19 +191,22 @@ func (w *Worker) processWorkflowTask(ctx context.Context, task *storage.TaskQueu
 	tenantID := storage.PgtypeToUUID(task.TenantID)
 
 	// Load workflow from database
-	wfModel, err := w.store.GetWorkflow(ctx, task.TenantID, task.WorkflowID)
+	wfModel, err := w.store.GetWorkflow(ctx, task.WorkflowName, task.TenantID, task.WorkflowID)
 	if err != nil {
 		return fmt.Errorf("failed to load workflow: %w", err)
 	}
 
-	// Get workflow definition from registry (thread-safe)
-	workflowEntry, ok := globalWorkflowRegistry.get(wfModel.Name)
+	// Extract base workflow name (remove shard suffix)
+	baseName := ExtractBaseWorkflowName(wfModel.Name)
+
+	// Get workflow definition from registry using base name (thread-safe)
+	workflowEntry, ok := globalWorkflowRegistry.get(baseName)
 	if !ok {
-		return fmt.Errorf("workflow %s not registered", wfModel.Name)
+		return fmt.Errorf("workflow %s not registered", baseName)
 	}
 
 	// Execute workflow using type-erased execution
-	return w.executeWorkflow(ctx, workflowID, tenantID, wfModel, workflowEntry)
+	return w.executeWorkflow(ctx, wfModel.Name, workflowID, tenantID, wfModel, workflowEntry)
 }
 
 // processActivityTask executes an activity task.
@@ -217,7 +230,7 @@ func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueu
 	}
 
 	// Load activity from database
-	actModel, err := w.store.GetActivity(ctx, task.TenantID, storage.UUIDToPgtype(activityID))
+	actModel, err := w.store.GetActivity(ctx, task.WorkflowName, task.TenantID, storage.UUIDToPgtype(activityID))
 	if err != nil {
 		return fmt.Errorf("failed to load activity: %w", err)
 	}
@@ -232,7 +245,7 @@ func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueu
 	}
 
 	// Update status to running
-	if err := w.store.UpdateActivityStatus(ctx, task.TenantID, actModel.ID, string(ActivityStatusRunning)); err != nil {
+	if err := w.store.UpdateActivityStatus(ctx, task.WorkflowName, task.TenantID, actModel.ID, string(ActivityStatusRunning)); err != nil {
 		return fmt.Errorf("failed to update activity status: %w", err)
 	}
 
@@ -308,7 +321,7 @@ func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueu
 	}
 
 	// Activity succeeded - save output
-	if err := w.store.UpdateActivityComplete(ctx, task.TenantID, actModel.ID, output); err != nil {
+	if err := w.store.UpdateActivityComplete(ctx, task.WorkflowName, task.TenantID, actModel.ID, output); err != nil {
 		return fmt.Errorf("failed to update activity as completed: %w", err)
 	}
 
@@ -341,7 +354,7 @@ func (w *Worker) processTimerTask(ctx context.Context, task *storage.TaskQueueMo
 	}
 
 	// Mark timer as fired
-	if err := w.store.MarkTimerFired(ctx, task.TenantID, storage.UUIDToPgtype(timerID)); err != nil {
+	if err := w.store.MarkTimerFired(ctx, task.WorkflowName, task.TenantID, storage.UUIDToPgtype(timerID)); err != nil {
 		return fmt.Errorf("failed to mark timer as fired: %w", err)
 	}
 
@@ -357,26 +370,27 @@ func (w *Worker) processTimerTask(ctx context.Context, task *storage.TaskQueueMo
 // This implements the full workflow execution with deterministic replay.
 func (w *Worker) executeWorkflow(
 	ctx context.Context,
+	workflowName string,
 	workflowID uuid.UUID,
 	tenantID uuid.UUID,
 	wfModel *storage.WorkflowModel,
 	workflowEntry *WorkflowRegistryEntry,
 ) error {
 	// Update status to running
-	if err := w.store.UpdateWorkflowStatus(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), string(StatusRunning)); err != nil {
+	if err := w.store.UpdateWorkflowStatus(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), string(StatusRunning)); err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
 	}
 
 	// 1. Deserialize input using type info from registry
 	input, err := registry.Deserialize(workflowEntry.inputType.Name, wfModel.Input)
 	if err != nil {
-		return w.failWorkflow(ctx, tenantID, workflowID, fmt.Errorf("failed to deserialize input: %w", err))
+		return w.failWorkflow(ctx, workflowName, tenantID, workflowID, fmt.Errorf("failed to deserialize input: %w", err))
 	}
 
 	// 2. Load activity results for replay
 	activityResults := make(map[int]interface{})
 	activityErrors := make(map[int]error)
-	activities, err := w.store.GetActivitiesByWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	activities, err := w.store.GetActivitiesByWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return fmt.Errorf("failed to load activities: %w", err)
 	}
@@ -401,7 +415,7 @@ func (w *Worker) executeWorkflow(
 
 	// Load timer results for replay
 	timerResults := make(map[int]time.Time)
-	timers, err := w.store.GetTimersByWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	timers, err := w.store.GetTimersByWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return fmt.Errorf("failed to load timers: %w", err)
 	}
@@ -416,7 +430,7 @@ func (w *Worker) executeWorkflow(
 	// Load time results and random results for replay from history events
 	timeResults := make(map[int]time.Time)
 	randomResults := make(map[int][]byte)
-	historyEvents, err := w.store.GetHistoryEvents(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	historyEvents, err := w.store.GetHistoryEvents(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return fmt.Errorf("failed to load history events: %w", err)
 	}
@@ -454,7 +468,7 @@ func (w *Worker) executeWorkflow(
 
 	// Load signal results for replay - store raw JSON, will be deserialized on demand
 	signalResults := make(map[string]interface{})
-	signals, err := w.store.GetSignalsByWorkflow(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	signals, err := w.store.GetSignalsByWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return fmt.Errorf("failed to load signals: %w", err)
 	}
@@ -489,7 +503,7 @@ func (w *Worker) executeWorkflow(
 				} else {
 					// Unexpected panic - mark workflow as failed
 					panicErr := fmt.Errorf("workflow panicked: %v", r)
-					if err := w.failWorkflow(ctx, tenantID, workflowID, panicErr); err != nil {
+					if err := w.failWorkflow(ctx, workflowName, tenantID, workflowID, panicErr); err != nil {
 						fmt.Printf("Failed to mark workflow as failed: %v\n", err)
 					}
 				}
@@ -529,7 +543,7 @@ func (w *Worker) executeWorkflow(
 			return fmt.Errorf("failed to serialize activity results: %w", err)
 		}
 
-		if err := w.store.UpdateWorkflowSequence(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), currentSequenceNum, activityResultsJSON); err != nil {
+		if err := w.store.UpdateWorkflowSequence(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), currentSequenceNum, activityResultsJSON); err != nil {
 			return fmt.Errorf("failed to update workflow sequence: %w", err)
 		}
 		return nil
@@ -537,25 +551,25 @@ func (w *Worker) executeWorkflow(
 
 	// 5. Workflow completed - check for error
 	if execErr != nil {
-		return w.failWorkflow(ctx, tenantID, workflowID, execErr)
+		return w.failWorkflow(ctx, workflowName, tenantID, workflowID, execErr)
 	}
 
 	// 6. Serialize and save output
 	outputData, err := json.Marshal(output)
 	if err != nil {
-		return w.failWorkflow(ctx, tenantID, workflowID, fmt.Errorf("failed to serialize output: %w", err))
+		return w.failWorkflow(ctx, workflowName, tenantID, workflowID, fmt.Errorf("failed to serialize output: %w", err))
 	}
 
-	if err := w.store.UpdateWorkflowComplete(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), outputData); err != nil {
-		return fmt.Errorf("failed to mark workflow as completed: %w", err)
+	if err := w.store.UpdateWorkflowComplete(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), outputData); err != nil {
+		return fmt.Errorf("failed to update workflow as completed: %w", err)
 	}
 
 	return nil
 }
 
 // failWorkflow marks a workflow as failed.
-func (w *Worker) failWorkflow(ctx context.Context, tenantID, workflowID uuid.UUID, err error) error {
-	if updateErr := w.store.UpdateWorkflowFailed(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), err.Error()); updateErr != nil {
+func (w *Worker) failWorkflow(ctx context.Context, workflowName string, tenantID, workflowID uuid.UUID, err error) error {
+	if updateErr := w.store.UpdateWorkflowFailed(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), err.Error()); updateErr != nil {
 		return fmt.Errorf("failed to mark workflow as failed: %w", updateErr)
 	}
 	return err
