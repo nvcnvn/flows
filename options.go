@@ -11,7 +11,6 @@ type contextKey string
 
 const (
 	tenantIDKey contextKey = "flows_tenant_id"
-	txKey       contextKey = "flows_tx"
 )
 
 // WithTenantID returns a context with the tenant ID set.

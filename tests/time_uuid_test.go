@@ -72,11 +72,17 @@ var TimeTrackingWorkflow = flows.New(
 		fmt.Printf("Workflow started at: %v\n", startTime)
 
 		// Generate time-based UUID v7 (uses Time() internally)
-		taskID := ctx.UUIDv7()
+		taskID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		fmt.Printf("Generated task ID: %s\n", taskID)
 
 		// Generate batch ID for demonstration
-		batchID := ctx.UUIDv7()
+		batchID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 
 		// Collect multiple UUIDs to verify time-ordering
 		uuids := []string{
@@ -84,14 +90,14 @@ var TimeTrackingWorkflow = flows.New(
 			batchID.String(),
 		}
 
-		// Log the start
-		_, err := flows.ExecuteActivity(ctx, LogEntryActivity, &LogEntryInput{
+		// Log workflow start
+		_, err = flows.ExecuteActivity(ctx, LogEntryActivity, &LogEntryInput{
 			TaskID:    taskID.String(),
 			Message:   fmt.Sprintf("Task started: %s", input.TaskName),
 			Timestamp: startTime,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to log start: %w", err)
+			return nil, err
 		}
 
 		// Sleep for a deterministic amount of time
@@ -105,7 +111,10 @@ var TimeTrackingWorkflow = flows.New(
 		fmt.Printf("Processing time recorded at: %v\n", processingTime)
 
 		// Generate another UUID - should have later timestamp
-		processingID := ctx.UUIDv7()
+		processingID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		uuids = append(uuids, processingID.String())
 
 		// Log processing checkpoint
@@ -144,7 +153,10 @@ var TimeTrackingWorkflow = flows.New(
 		totalDuration := completionTime.Sub(startTime)
 
 		// Generate final UUID
-		completionID := ctx.UUIDv7()
+		completionID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		uuids = append(uuids, completionID.String())
 
 		// Log completion

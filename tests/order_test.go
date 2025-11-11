@@ -88,7 +88,11 @@ var OrderWorkflow = flows.New(
 	1,
 	func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
 		input := ctx.Input()
-		orderID := ctx.UUIDv7().String()
+		orderUUID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
+		orderID := orderUUID.String()
 
 		fmt.Printf("Starting order workflow: order_id=%s, customer=%s\n", orderID, input.CustomerID)
 

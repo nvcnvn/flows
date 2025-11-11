@@ -2,9 +2,10 @@ package flows
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,20 +22,54 @@ type Workflow[In, Out any] struct {
 	outputType registry.TypeInfo
 }
 
+// workflowExecutionContext contains all parameters needed to execute a workflow.
+type workflowExecutionContext struct {
+	Ctx             context.Context
+	WorkflowID      uuid.UUID
+	TenantID        uuid.UUID
+	Input           interface{}
+	SequenceNum     int
+	WorkflowName    string
+	Store           *storage.Store
+	PauseFunc       func() error
+	ActivityResults map[int]interface{}
+	ActivityErrors  map[int]error
+	TimerResults    map[int]time.Time
+	TimeResults     map[int]time.Time
+	RandomResults   map[int][]byte
+	SignalResults   map[string]interface{}
+}
+
 // WorkflowRegistryEntry stores workflow metadata and execution function.
 type WorkflowRegistryEntry struct {
-	inputType  registry.TypeInfo                                                                                                                                                                                                               // Type information for input
-	outputType registry.TypeInfo                                                                                                                                                                                                               // Type information for output
-	execute    func(context.Context, uuid.UUID, uuid.UUID, interface{}, int, string, *storage.Store, func() error, map[int]interface{}, map[int]error, map[int]time.Time, map[int]time.Time, map[string]interface{}) (interface{}, int, error) // Type-erased execution function - returns (output, finalSequenceNum, error)
+	inputType  registry.TypeInfo                                         // Type information for input
+	outputType registry.TypeInfo                                         // Type information for output
+	execute    func(*workflowExecutionContext) (interface{}, int, error) // Type-erased execution function - returns (output, finalSequenceNum, error)
 }
 
 // WorkflowRegistry stores registered workflows for execution.
 type WorkflowRegistry struct {
+	mu        sync.RWMutex
 	workflows map[string]*WorkflowRegistryEntry // name -> registry entry
 }
 
 var globalWorkflowRegistry = &WorkflowRegistry{
 	workflows: make(map[string]*WorkflowRegistryEntry),
+}
+
+// register adds a workflow to the registry (thread-safe).
+func (r *WorkflowRegistry) register(name string, entry *WorkflowRegistryEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.workflows[name] = entry
+}
+
+// get retrieves a workflow from the registry (thread-safe).
+func (r *WorkflowRegistry) get(name string) (*WorkflowRegistryEntry, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, ok := r.workflows[name]
+	return entry, ok
 }
 
 // New creates a new workflow definition.
@@ -52,48 +87,30 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 	}
 
 	// Create a type-erased execution function that constructs Context[In] and executes the workflow
-	executeFunc := func(
-		ctx context.Context,
-		workflowID uuid.UUID,
-		tenantID uuid.UUID,
-		input interface{},
-		sequenceNum int,
-		workflowName string,
-		store *storage.Store,
-		pauseFunc func() error,
-		activityResults map[int]interface{},
-		activityErrors map[int]error,
-		timerResults map[int]time.Time,
-		timeResults map[int]time.Time,
-		signalResults map[string]interface{},
-	) (interface{}, int, error) {
+	executeFunc := func(execCtx *workflowExecutionContext) (interface{}, int, error) {
 		// Cast input to the correct type
-		typedInput, ok := input.(*In)
+		typedInput, ok := execCtx.Input.(*In)
 		if !ok {
 			// This should never happen if deserialization worked correctly
-			return nil, 0, fmt.Errorf("input type mismatch: expected *%s, got %T", inputType.Name, input)
+			return nil, 0, fmt.Errorf("input type mismatch: expected *%s, got %T", inputType.Name, execCtx.Input)
 		}
-
-		// Create deterministic random generator
-		seed := int64(workflowID.ID())
-		rnd := rand.New(rand.NewSource(seed))
 
 		// Construct Context[In] directly
 		wfCtx := &Context[In]{
-			ctx:             ctx,
-			workflowID:      workflowID,
-			tenantID:        tenantID,
+			ctx:             execCtx.Ctx,
+			workflowID:      execCtx.WorkflowID,
+			tenantID:        execCtx.TenantID,
 			input:           typedInput,
-			sequenceNum:     sequenceNum,
-			workflowName:    workflowName,
-			store:           store,
-			activityResults: activityResults,
-			activityErrors:  activityErrors,
-			timerResults:    timerResults,
-			timeResults:     timeResults,
-			signalResults:   signalResults,
-			rnd:             rnd,
-			pauseFunc:       pauseFunc,
+			sequenceNum:     execCtx.SequenceNum,
+			workflowName:    execCtx.WorkflowName,
+			store:           execCtx.Store,
+			activityResults: execCtx.ActivityResults,
+			activityErrors:  execCtx.ActivityErrors,
+			timerResults:    execCtx.TimerResults,
+			timeResults:     execCtx.TimeResults,
+			randomResults:   execCtx.RandomResults,
+			signalResults:   execCtx.SignalResults,
+			pauseFunc:       execCtx.PauseFunc,
 		}
 
 		// Execute workflow function directly (no reflection needed)
@@ -102,12 +119,12 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 		return output, wfCtx.sequenceNum, err
 	}
 
-	// Register workflow in global registry with execution function
-	globalWorkflowRegistry.workflows[name] = &WorkflowRegistryEntry{
+	// Register workflow in global registry with execution function (thread-safe)
+	globalWorkflowRegistry.register(name, &WorkflowRegistryEntry{
 		inputType:  inputType,
 		outputType: outputType,
 		execute:    executeFunc,
-	}
+	})
 
 	return wf
 }
@@ -152,10 +169,8 @@ type Context[T any] struct {
 	activityErrors  map[int]error
 	timerResults    map[int]time.Time
 	timeResults     map[int]time.Time // Recorded times for deterministic Time() calls
+	randomResults   map[int][]byte    // Recorded random bytes for deterministic Random() calls
 	signalResults   map[string]interface{}
-
-	// Deterministic random
-	rnd *rand.Rand
 
 	// Pause function (set by executor)
 	pauseFunc func() error
@@ -317,10 +332,116 @@ func (c *Context[T]) Sleep(duration time.Duration) error {
 	return ErrWorkflowPaused
 }
 
-// Random returns a deterministic random number generator.
-// Always returns the same sequence for the same workflow execution.
-func (c *Context[T]) Random() *rand.Rand {
-	return c.rnd
+// Random generates cryptographically secure random bytes and stores them in the database.
+// During replay, returns the cached random bytes from the first execution.
+// This provides true random generation while maintaining deterministic replay.
+// Returns the requested number of random bytes.
+func (c *Context[T]) Random(numBytes int) ([]byte, error) {
+	c.sequenceNum++
+	currentSeq := c.sequenceNum
+
+	// Check if we have cached random bytes (replay)
+	if cachedBytes, ok := c.randomResults[currentSeq]; ok {
+		return cachedBytes, nil
+	}
+
+	// First execution - generate cryptographically secure random bytes
+	randomBytes := make([]byte, numBytes)
+	if _, err := cryptorand.Read(randomBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+
+	// Create history event to record the random bytes
+	eventData, _ := json.Marshal(map[string]interface{}{
+		"random_bytes": randomBytes,
+		"num_bytes":    numBytes,
+	})
+
+	eventID := uuid.New()
+	historyEvent := &storage.HistoryEventModel{
+		ID:          storage.UUIDToPgtype(eventID),
+		TenantID:    storage.UUIDToPgtype(c.tenantID),
+		WorkflowID:  storage.UUIDToPgtype(c.workflowID),
+		SequenceNum: currentSeq,
+		EventType:   string(EventRandomGenerated),
+		EventData:   eventData,
+	}
+
+	if err := c.store.CreateHistoryEvent(c.ctx, historyEvent, nil); err != nil {
+		// If we can't record the random bytes, return error
+		// This ensures we don't generate different random values on replay
+		return nil, fmt.Errorf("failed to record random bytes: %w", err)
+	}
+
+	// Cache for current execution
+	c.randomResults[currentSeq] = randomBytes
+
+	return randomBytes, nil
+}
+
+// RandomInt generates a cryptographically secure random integer in the range [0, max).
+// Uses Random() internally to ensure deterministic replay.
+func (c *Context[T]) RandomInt(max int) (int, error) {
+	if max <= 0 {
+		return 0, fmt.Errorf("max must be positive")
+	}
+
+	// Calculate number of bytes needed
+	numBytes := 4 // Use 4 bytes for int32 range
+	if max > 1<<24 {
+		numBytes = 8 // Use 8 bytes for larger ranges
+	}
+
+	randomBytes, err := c.Random(numBytes)
+	if err != nil {
+		return 0, err
+	}
+
+	// Convert bytes to uint64
+	var value uint64
+	for i := 0; i < len(randomBytes) && i < 8; i++ {
+		value |= uint64(randomBytes[i]) << (i * 8)
+	}
+
+	// Return value in range [0, max)
+	return int(value % uint64(max)), nil
+}
+
+// RandomInt63 generates a cryptographically secure random int64 in the range [0, 2^63).
+// Uses Random() internally to ensure deterministic replay.
+func (c *Context[T]) RandomInt63() (int64, error) {
+	randomBytes, err := c.Random(8)
+	if err != nil {
+		return 0, err
+	}
+
+	// Convert bytes to int64 and mask to get positive value
+	var value int64
+	for i := 0; i < 8; i++ {
+		value |= int64(randomBytes[i]) << (i * 8)
+	}
+
+	// Ensure positive by masking the sign bit
+	return value & 0x7FFFFFFFFFFFFFFF, nil
+}
+
+// RandomFloat64 generates a cryptographically secure random float64 in the range [0.0, 1.0).
+// Uses Random() internally to ensure deterministic replay.
+func (c *Context[T]) RandomFloat64() (float64, error) {
+	randomBytes, err := c.Random(8)
+	if err != nil {
+		return 0, err
+	}
+
+	// Convert bytes to uint64
+	var value uint64
+	for i := 0; i < 8; i++ {
+		value |= uint64(randomBytes[i]) << (i * 8)
+	}
+
+	// Convert to float64 in range [0.0, 1.0)
+	// Use 53 bits of precision (standard for float64)
+	return float64(value&((1<<53)-1)) / float64(1<<53), nil
 }
 
 // Time returns the current time deterministically.
@@ -365,17 +486,24 @@ func (c *Context[T]) Time() time.Time {
 	return now
 }
 
-// UUIDv7 generates a deterministic time-ordered UUID based on recorded time.
-// Uses the Time() primitive to ensure deterministic timestamps during replay.
-func (c *Context[T]) UUIDv7() uuid.UUID {
+// UUIDv7 generates a deterministic time-ordered UUID based on recorded time and random bytes.
+// Uses the Time() primitive to ensure deterministic timestamps during replay,
+// and Random() to ensure cryptographically secure random bits that replay deterministically.
+func (c *Context[T]) UUIDv7() (uuid.UUID, error) {
 	// Get deterministic time - this will increment sequence internally
 	recordedTime := c.Time()
 
 	// Extract timestamp in milliseconds for UUID v7
 	unixMs := recordedTime.UnixMilli()
 
-	// Create UUID v7 with deterministic timestamp and random bits from workflow's RNG
+	// Get cryptographically secure random bytes - this will also increment sequence
 	// UUID v7 format: 48 bits timestamp + 12 bits version/variant + 62 bits random
+	// We need 10 bytes of random data (bytes 6-15)
+	randomBytes, err := c.Random(10)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to generate random bytes for UUID: %w", err)
+	}
+
 	var uuidBytes [16]byte
 
 	// 48-bit timestamp (milliseconds since epoch)
@@ -386,10 +514,8 @@ func (c *Context[T]) UUIDv7() uuid.UUID {
 	uuidBytes[4] = byte(unixMs >> 8)
 	uuidBytes[5] = byte(unixMs)
 
-	// Fill remaining bytes with deterministic random data
-	for i := 6; i < 16; i++ {
-		uuidBytes[i] = byte(c.rnd.Int31n(256))
-	}
+	// Fill remaining bytes with cryptographically secure random data
+	copy(uuidBytes[6:], randomBytes)
 
 	// Set version (7) in bits 48-51
 	uuidBytes[6] = (uuidBytes[6] & 0x0f) | 0x70
@@ -397,7 +523,7 @@ func (c *Context[T]) UUIDv7() uuid.UUID {
 	// Set variant (10) in bits 64-65
 	uuidBytes[8] = (uuidBytes[8] & 0x3f) | 0x80
 
-	return uuid.UUID(uuidBytes)
+	return uuid.UUID(uuidBytes), nil
 }
 
 // WaitForSignal waits for an external signal with the given name.
@@ -475,6 +601,11 @@ func (c *Context[T]) SetTimerResult(seq int, firedAt time.Time) {
 // SetTimeResult sets a recorded time (used during replay).
 func (c *Context[T]) SetTimeResult(seq int, recordedTime time.Time) {
 	c.timeResults[seq] = recordedTime
+}
+
+// SetRandomResult sets cached random bytes (used during replay).
+func (c *Context[T]) SetRandomResult(seq int, randomBytes []byte) {
+	c.randomResults[seq] = randomBytes
 }
 
 // SetSignalResult sets a cached signal payload (used during replay).

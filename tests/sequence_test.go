@@ -261,7 +261,10 @@ func TestSequenceNumber_MixedOperations(t *testing.T) {
 			recordedTime := ctx.Time()
 
 			// Operation 3: UUID generation (deterministic)
-			generatedUUID := ctx.UUIDv7()
+			generatedUUID, err := ctx.UUIDv7()
+			if err != nil {
+				return nil, err
+			}
 
 			// Operation 4: Sleep (timer)
 			if err := ctx.Sleep(100 * time.Millisecond); err != nil {

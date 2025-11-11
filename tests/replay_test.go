@@ -129,11 +129,17 @@ var ReplayTestWorkflow = flows.New(
 		fmt.Printf("[Workflow] Initial time: %v\n", initialTime)
 
 		// Generate execution ID - will be identical on replay
-		executionID := ctx.UUIDv7()
+		executionID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		fmt.Printf("[Workflow] Execution ID: %s\n", executionID)
 
 		// Generate batch ID - will be identical on replay
-		batchID := ctx.UUIDv7()
+		batchID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		fmt.Printf("[Workflow] Batch ID: %s\n", batchID)
 
 		uuids := []string{
@@ -152,7 +158,10 @@ var ReplayTestWorkflow = flows.New(
 		fmt.Printf("[Workflow] Time before activity: %v\n", beforeFailTime)
 
 		// Generate UUID before activity - will be identical on replay
-		preActivityID := ctx.UUIDv7()
+		preActivityID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		uuids = append(uuids, preActivityID.String())
 
 		// Attempt to process the job - this will fail on first execution
@@ -182,7 +191,10 @@ var ReplayTestWorkflow = flows.New(
 		fmt.Printf("[Workflow] Time after retry: %v\n", afterRetryTime)
 
 		// Generate UUID after retry - will be identical on replay
-		postRetryID := ctx.UUIDv7()
+		postRetryID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		uuids = append(uuids, postRetryID.String())
 
 		// Record completion time
@@ -190,7 +202,10 @@ var ReplayTestWorkflow = flows.New(
 		totalDuration := completionTime.Sub(initialTime)
 
 		// Generate final UUID
-		finalID := ctx.UUIDv7()
+		finalID, err := ctx.UUIDv7()
+		if err != nil {
+			return nil, err
+		}
 		uuids = append(uuids, finalID.String())
 
 		fmt.Printf("[Workflow] Completed. Duration: %v\n", totalDuration)
@@ -562,7 +577,10 @@ func TestReplayWorkflow_MultipleFailures(t *testing.T) {
 		1,
 		func(ctx *flows.Context[ReplayWorkflowInput]) (*ReplayWorkflowOutput, error) {
 			startTime := ctx.Time()
-			execID := ctx.UUIDv7()
+			execID, err := ctx.UUIDv7()
+			if err != nil {
+				return nil, err
+			}
 
 			// Call activity that will fail twice
 			result, err := flows.ExecuteActivity(ctx, MultiFailActivity, &ProcessJobInput{

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,7 +53,12 @@ func executeInTx(ctx context.Context, store *storage.Store, tx Tx, fn func(Tx) e
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer newTx.Rollback(ctx)
+	defer func() {
+		rollbackErr := newTx.Rollback(ctx)
+		if err == nil {
+			slog.Error("executeInTx Rollback error", "error", rollbackErr)
+		}
+	}()
 
 	if err := fn(newTx); err != nil {
 		return err
@@ -265,11 +272,23 @@ func (eng *Engine) RerunFromDLQ(
 }
 
 // Global engine instance (can be set by user or created automatically)
-var globalEngine *Engine
+var (
+	globalEngine   *Engine
+	globalEngineMu sync.RWMutex
+)
 
 // SetEngine sets the global engine instance.
 func SetEngine(engine *Engine) {
+	globalEngineMu.Lock()
+	defer globalEngineMu.Unlock()
 	globalEngine = engine
+}
+
+// getGlobalEngine safely retrieves the global engine instance.
+func getGlobalEngine() *Engine {
+	globalEngineMu.RLock()
+	defer globalEngineMu.RUnlock()
+	return globalEngine
 }
 
 // Start starts a workflow using the global engine.
@@ -279,10 +298,11 @@ func Start[In, Out any](
 	input *In,
 	opts ...StartOption,
 ) (*Execution[Out], error) {
-	if globalEngine == nil {
+	engine := getGlobalEngine()
+	if engine == nil {
 		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return startInternal(globalEngine.store, ctx, wf, input, opts...)
+	return startInternal(engine.store, ctx, wf, input, opts...)
 }
 
 // SendSignal sends a signal using the global engine.
@@ -293,24 +313,27 @@ func SendSignal[P any](
 	payload *P,
 	opts ...SignalOption,
 ) error {
-	if globalEngine == nil {
+	engine := getGlobalEngine()
+	if engine == nil {
 		return fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return sendSignalInternal(globalEngine.store, ctx, workflowID, signalName, payload, opts...)
+	return sendSignalInternal(engine.store, ctx, workflowID, signalName, payload, opts...)
 }
 
 // Query queries workflow status using the global engine.
 func Query(ctx context.Context, workflowID uuid.UUID) (*WorkflowInfo, error) {
-	if globalEngine == nil {
+	engine := getGlobalEngine()
+	if engine == nil {
 		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return globalEngine.Query(ctx, workflowID)
+	return engine.Query(ctx, workflowID)
 }
 
 // RerunFromDLQ reruns from DLQ using the global engine.
 func RerunFromDLQ(ctx context.Context, dlqID uuid.UUID, opts ...RerunOption) (uuid.UUID, error) {
-	if globalEngine == nil {
+	engine := getGlobalEngine()
+	if engine == nil {
 		return uuid.Nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return globalEngine.RerunFromDLQ(ctx, dlqID, opts...)
+	return engine.RerunFromDLQ(ctx, dlqID, opts...)
 }

@@ -62,6 +62,7 @@ const (
 	EventSignalReceived    EventType = "SIGNAL_RECEIVED"
 	EventSignalConsumed    EventType = "SIGNAL_CONSUMED"
 	EventTimeRecorded      EventType = "TIME_RECORDED"
+	EventRandomGenerated   EventType = "RANDOM_GENERATED"
 )
 
 // Error definitions

@@ -186,8 +186,8 @@ func (w *Worker) processWorkflowTask(ctx context.Context, task *storage.TaskQueu
 		return fmt.Errorf("failed to load workflow: %w", err)
 	}
 
-	// Get workflow definition from registry
-	workflowEntry, ok := globalWorkflowRegistry.workflows[wfModel.Name]
+	// Get workflow definition from registry (thread-safe)
+	workflowEntry, ok := globalWorkflowRegistry.get(wfModel.Name)
 	if !ok {
 		return fmt.Errorf("workflow %s not registered", wfModel.Name)
 	}
@@ -225,8 +225,8 @@ func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueu
 		return fmt.Errorf("activity not found: %s", activityID)
 	}
 
-	// Get activity definition from registry
-	activityEntry, ok := globalActivityRegistry.activities[actModel.Name]
+	// Get activity definition from registry (thread-safe)
+	activityEntry, ok := globalActivityRegistry.get(actModel.Name)
 	if !ok {
 		return fmt.Errorf("activity %s not registered", actModel.Name)
 	}
@@ -383,8 +383,8 @@ func (w *Worker) executeWorkflow(
 
 	for _, act := range activities {
 		if act.Status == string(ActivityStatusCompleted) {
-			// Deserialize activity output
-			actEntry, ok := globalActivityRegistry.activities[act.Name]
+			// Deserialize activity output (thread-safe)
+			actEntry, ok := globalActivityRegistry.get(act.Name)
 			if !ok {
 				continue // Skip unregistered activities
 			}
@@ -413,8 +413,9 @@ func (w *Worker) executeWorkflow(
 		}
 	}
 
-	// Load time results for replay from history events
+	// Load time results and random results for replay from history events
 	timeResults := make(map[int]time.Time)
+	randomResults := make(map[int][]byte)
 	historyEvents, err := w.store.GetHistoryEvents(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return fmt.Errorf("failed to load history events: %w", err)
@@ -428,6 +429,23 @@ func (w *Worker) executeWorkflow(
 				if timeStr, ok := eventData["recorded_time"].(string); ok {
 					if recordedTime, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
 						timeResults[event.SequenceNum] = recordedTime
+					}
+				}
+			}
+		} else if event.EventType == string(EventRandomGenerated) {
+			// Parse the recorded random bytes from event data
+			var eventData map[string]interface{}
+			if err := json.Unmarshal(event.EventData, &eventData); err == nil {
+				if randomBytesIface, ok := eventData["random_bytes"]; ok {
+					// Random bytes are stored as []interface{} (JSON array of numbers)
+					if randomBytesSlice, ok := randomBytesIface.([]interface{}); ok {
+						randomBytes := make([]byte, len(randomBytesSlice))
+						for i, b := range randomBytesSlice {
+							if byteVal, ok := b.(float64); ok {
+								randomBytes[i] = byte(byteVal)
+							}
+						}
+						randomResults[event.SequenceNum] = randomBytes
 					}
 				}
 			}
@@ -480,21 +498,23 @@ func (w *Worker) executeWorkflow(
 
 		// Execute workflow directly using the type-erased execute function
 		// Returns: output, finalSequenceNum, error
-		output, finalSequenceNum, execErr = workflowEntry.execute(
-			ctx,
-			workflowID,
-			tenantID,
-			input,
-			wfModel.SequenceNum,
-			wfModel.Name,
-			w.store,
-			pauseFunc,
-			activityResults,
-			activityErrors,
-			timerResults,
-			timeResults,
-			signalResults,
-		)
+		execCtx := &workflowExecutionContext{
+			Ctx:             ctx,
+			WorkflowID:      workflowID,
+			TenantID:        tenantID,
+			Input:           input,
+			SequenceNum:     wfModel.SequenceNum,
+			WorkflowName:    wfModel.Name,
+			Store:           w.store,
+			PauseFunc:       pauseFunc,
+			ActivityResults: activityResults,
+			ActivityErrors:  activityErrors,
+			TimerResults:    timerResults,
+			TimeResults:     timeResults,
+			RandomResults:   randomResults,
+			SignalResults:   signalResults,
+		}
+		output, finalSequenceNum, execErr = workflowEntry.execute(execCtx)
 	}()
 
 	// Check if workflow was paused

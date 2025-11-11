@@ -3,6 +3,7 @@ package flows
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/nvcnvn/flows/internal/registry"
@@ -27,11 +28,27 @@ type ActivityRegistryEntry struct {
 
 // ActivityRegistry stores registered activities for execution.
 type ActivityRegistry struct {
+	mu         sync.RWMutex
 	activities map[string]*ActivityRegistryEntry // name -> registry entry
 }
 
 var globalActivityRegistry = &ActivityRegistry{
 	activities: make(map[string]*ActivityRegistryEntry),
+}
+
+// register adds an activity to the registry (thread-safe).
+func (r *ActivityRegistry) register(name string, entry *ActivityRegistryEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.activities[name] = entry
+}
+
+// get retrieves an activity from the registry (thread-safe).
+func (r *ActivityRegistry) get(name string) (*ActivityRegistryEntry, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, ok := r.activities[name]
+	return entry, ok
 }
 
 // NewActivity creates a new activity definition.
@@ -61,13 +78,13 @@ func NewActivity[In, Out any](
 		return fn(ctx, typedInput)
 	}
 
-	// Register activity in global registry with execution function
-	globalActivityRegistry.activities[name] = &ActivityRegistryEntry{
+	// Register activity in global registry with execution function (thread-safe)
+	globalActivityRegistry.register(name, &ActivityRegistryEntry{
 		inputType:   inputType,
 		outputType:  outputType,
 		retryPolicy: retryPolicy,
 		execute:     executeFunc,
-	}
+	})
 
 	return act
 }
