@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -53,7 +54,12 @@ func (s *Store) DequeueTask(ctx context.Context, tenantID pgtype.UUID, workflowN
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		rollbackErr := tx.Rollback(ctx)
+		if err == nil {
+			slog.Error("DequeueTask Rollback error", "error", rollbackErr)
+		}
+	}()
 
 	task := &TaskQueueModel{}
 	err = tx.QueryRow(ctx, query, tenantID, workflowNames).Scan(

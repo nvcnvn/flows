@@ -85,6 +85,8 @@ var TenantSignalWorkflow = flows.New(
 )
 
 func TestMultiTenantIsolation(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
@@ -203,6 +205,8 @@ func TestMultiTenantIsolation(t *testing.T) {
 }
 
 func TestMultiTenantWorkerIsolation(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
@@ -296,6 +300,8 @@ func TestMultiTenantWorkerIsolation(t *testing.T) {
 }
 
 func TestMultiTenantSignalIsolation(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	pool := SetupTestDB(t)

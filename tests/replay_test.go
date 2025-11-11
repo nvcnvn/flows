@@ -478,7 +478,12 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go worker.Run(workerCtx)
+	go func() {
+		runErr := worker.Run(workerCtx)
+		if runErr != nil && runErr != context.Canceled {
+			t.Logf("Worker error: %v", runErr)
+		}
+	}()
 
 	result1, err := exec.Get(ctx)
 	require.NoError(t, err)
@@ -610,7 +615,12 @@ func TestReplayWorkflow_MultipleFailures(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go worker.Run(workerCtx)
+	go func() {
+		runErr := worker.Run(workerCtx)
+		if runErr != nil && runErr != context.Canceled {
+			t.Logf("Worker error: %v", runErr)
+		}
+	}()
 
 	resultChan := make(chan struct {
 		result *ReplayWorkflowOutput

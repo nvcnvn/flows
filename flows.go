@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nvcnvn/flows/internal/registry"
 	"github.com/nvcnvn/flows/internal/storage"
@@ -36,6 +35,29 @@ func NewEngine(pool *pgxpool.Pool) *Engine {
 // Store returns the underlying storage.
 func (eng *Engine) Store() *storage.Store {
 	return eng.store
+}
+
+// executeInTx executes a function within a transaction.
+// If tx is provided, it uses that transaction; otherwise, it creates a new one.
+// The function fn receives the transaction to use for its operations.
+func executeInTx(ctx context.Context, store *storage.Store, tx Tx, fn func(Tx) error) error {
+	if tx != nil {
+		// Use provided transaction
+		return fn(tx)
+	}
+
+	// Create new transaction
+	newTx, err := store.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer newTx.Rollback(ctx)
+
+	if err := fn(newTx); err != nil {
+		return err
+	}
+
+	return newTx.Commit(ctx)
 }
 
 // startInternal is the internal implementation of Start.
@@ -81,39 +103,17 @@ func startInternal[In, Out any](
 	}
 
 	// Execute within transaction
-	if cfg.tx != nil {
-		// Use provided transaction
-		pgxTx, ok := cfg.tx.(pgx.Tx)
-		if !ok {
-			return nil, fmt.Errorf("invalid transaction type")
-		}
-
-		if err := store.CreateWorkflow(ctx, wfModel, pgxTx); err != nil {
-			return nil, fmt.Errorf("failed to create workflow: %w", err)
-		}
-
-		if err := store.EnqueueTask(ctx, taskModel, pgxTx); err != nil {
-			return nil, fmt.Errorf("failed to enqueue task: %w", err)
-		}
-	} else {
-		// Create internal transaction
-		tx, err := store.Pool().Begin(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to begin transaction: %w", err)
-		}
-		defer tx.Rollback(ctx)
-
+	err = executeInTx(ctx, store, cfg.tx, func(tx Tx) error {
 		if err := store.CreateWorkflow(ctx, wfModel, tx); err != nil {
-			return nil, fmt.Errorf("failed to create workflow: %w", err)
+			return fmt.Errorf("failed to create workflow: %w", err)
 		}
-
 		if err := store.EnqueueTask(ctx, taskModel, tx); err != nil {
-			return nil, fmt.Errorf("failed to enqueue task: %w", err)
+			return fmt.Errorf("failed to enqueue task: %w", err)
 		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("failed to commit transaction: %w", err)
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return &Execution[Out]{
@@ -166,33 +166,13 @@ func sendSignalInternal[P any](
 		VisibilityTimeout: time.Now(),
 	}
 
-	// Execute within transaction if provided
-	if cfg.tx != nil {
-		pgxTx, ok := cfg.tx.(pgx.Tx)
-		if !ok {
-			return fmt.Errorf("invalid transaction type")
-		}
-		if err := store.CreateSignal(ctx, signalModel, pgxTx); err != nil {
+	// Execute within transaction
+	return executeInTx(ctx, store, cfg.tx, func(tx Tx) error {
+		if err := store.CreateSignal(ctx, signalModel, tx); err != nil {
 			return err
 		}
-		return store.EnqueueTask(ctx, taskModel, pgxTx)
-	}
-
-	// Use transaction to ensure atomicity
-	tx, err := store.Pool().Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	if err := store.CreateSignal(ctx, signalModel, tx); err != nil {
-		return err
-	}
-	if err := store.EnqueueTask(ctx, taskModel, tx); err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+		return store.EnqueueTask(ctx, taskModel, tx)
+	})
 }
 
 // Query retrieves the current status of a workflow.
@@ -265,45 +245,20 @@ func (eng *Engine) RerunFromDLQ(
 	}
 
 	// Execute within transaction
-	if cfg.tx != nil {
-		pgxTx, ok := cfg.tx.(pgx.Tx)
-		if !ok {
-			return uuid.Nil, fmt.Errorf("invalid transaction type")
-		}
-
-		if err := eng.store.CreateWorkflow(ctx, wfModel, pgxTx); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to create workflow: %w", err)
-		}
-
-		if err := eng.store.EnqueueTask(ctx, taskModel, pgxTx); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to enqueue task: %w", err)
-		}
-
-		if err := eng.store.UpdateDLQRerun(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID), storage.UUIDToPgtype(newWorkflowID)); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to update DLQ: %w", err)
-		}
-	} else {
-		tx, err := eng.store.Pool().Begin(ctx)
-		if err != nil {
-			return uuid.Nil, fmt.Errorf("failed to begin transaction: %w", err)
-		}
-		defer tx.Rollback(ctx)
-
+	err = executeInTx(ctx, eng.store, cfg.tx, func(tx Tx) error {
 		if err := eng.store.CreateWorkflow(ctx, wfModel, tx); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to create workflow: %w", err)
+			return fmt.Errorf("failed to create workflow: %w", err)
 		}
-
 		if err := eng.store.EnqueueTask(ctx, taskModel, tx); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to enqueue task: %w", err)
+			return fmt.Errorf("failed to enqueue task: %w", err)
 		}
-
 		if err := eng.store.UpdateDLQRerun(ctx, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID), storage.UUIDToPgtype(newWorkflowID)); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to update DLQ: %w", err)
+			return fmt.Errorf("failed to update DLQ: %w", err)
 		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to commit transaction: %w", err)
-		}
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, err
 	}
 
 	return newWorkflowID, nil
