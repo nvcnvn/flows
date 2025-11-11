@@ -1,0 +1,490 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/nvcnvn/flows"
+)
+
+// Workflow Input/Output
+type LoanApplicationInput struct {
+	ApplicantID string  `json:"applicant_id"`
+	Amount      float64 `json:"amount"`
+	Purpose     string  `json:"purpose"`
+	CreditScore int     `json:"credit_score"`
+}
+
+type LoanApplicationOutput struct {
+	ApplicationID  string        `json:"application_id"`
+	Status         string        `json:"status"` // approved, rejected, pending
+	ApprovedAmount float64       `json:"approved_amount"`
+	InterestRate   float64       `json:"interest_rate"`
+	ApprovalSteps  []string      `json:"approval_steps"`
+	ProcessingTime time.Duration `json:"processing_time"`
+	DecisionReason string        `json:"decision_reason"`
+}
+
+// Activity Types
+type CreditCheckInput struct {
+	ApplicantID string `json:"applicant_id"`
+	CreditScore int    `json:"credit_score"`
+}
+
+type CreditCheckOutput struct {
+	Score     int    `json:"score"`
+	RiskLevel string `json:"risk_level"` // low, medium, high
+	ReportID  string `json:"report_id"`
+}
+
+type DocumentVerificationInput struct {
+	ApplicantID string   `json:"applicant_id"`
+	DocumentIDs []string `json:"document_ids"`
+}
+
+type DocumentVerificationOutput struct {
+	AllValid    bool     `json:"all_valid"`
+	InvalidDocs []string `json:"invalid_docs"`
+	VerifiedBy  string   `json:"verified_by"`
+}
+
+type RiskAssessmentInput struct {
+	Amount    float64 `json:"amount"`
+	RiskLevel string  `json:"risk_level"`
+	Purpose   string  `json:"purpose"`
+}
+
+type RiskAssessmentOutput struct {
+	Approved        bool    `json:"approved"`
+	MaxAmount       float64 `json:"max_amount"`
+	InterestRate    float64 `json:"interest_rate"`
+	RequiresManager bool    `json:"requires_manager"`
+}
+
+type FraudCheckInput struct {
+	ApplicantID string  `json:"applicant_id"`
+	Amount      float64 `json:"amount"`
+}
+
+type FraudCheckOutput struct {
+	Suspicious bool   `json:"suspicious"`
+	Score      int    `json:"score"`
+	Reason     string `json:"reason"`
+}
+
+type NotificationInput struct {
+	ApplicantID string `json:"applicant_id"`
+	Message     string `json:"message"`
+	Channel     string `json:"channel"` // email, sms
+}
+
+type NotificationOutput struct {
+	Sent      bool   `json:"sent"`
+	MessageID string `json:"message_id"`
+}
+
+// Signal Types
+type ManagerApprovalSignal struct {
+	Approved  bool   `json:"approved"`
+	ManagerID string `json:"manager_id"`
+	Comments  string `json:"comments"`
+}
+
+// Activity 1: Credit Check (might fail temporarily)
+var CreditCheckActivity = flows.NewActivity(
+	"credit-check",
+	func(ctx context.Context, input *CreditCheckInput) (*CreditCheckOutput, error) {
+		fmt.Printf("[CreditCheck] Checking credit for applicant: %s\n", input.ApplicantID)
+
+		// Simulate external API call that might fail
+		time.Sleep(500 * time.Millisecond)
+
+		// Determine risk level based on credit score
+		var riskLevel string
+		switch {
+		case input.CreditScore >= 750:
+			riskLevel = "low"
+		case input.CreditScore >= 650:
+			riskLevel = "medium"
+		default:
+			riskLevel = "high"
+		}
+
+		return &CreditCheckOutput{
+			Score:     input.CreditScore,
+			RiskLevel: riskLevel,
+			ReportID:  fmt.Sprintf("CREDIT-%s", uuid.New().String()[:8]),
+		}, nil
+	},
+	flows.RetryPolicy{
+		InitialInterval: 1 * time.Second,
+		MaxInterval:     10 * time.Second,
+		BackoffFactor:   2.0,
+		MaxAttempts:     3,
+		Jitter:          0.1,
+	},
+)
+
+// Activity 2: Document Verification (loops through documents)
+var DocumentVerificationActivity = flows.NewActivity(
+	"document-verification",
+	func(ctx context.Context, input *DocumentVerificationInput) (*DocumentVerificationOutput, error) {
+		fmt.Printf("[DocVerification] Verifying documents for: %s\n", input.ApplicantID)
+
+		time.Sleep(300 * time.Millisecond)
+
+		// Simulate document validation
+		invalidDocs := []string{}
+		for _, docID := range input.DocumentIDs {
+			// Random validation logic
+			if len(docID) < 5 {
+				invalidDocs = append(invalidDocs, docID)
+			}
+		}
+
+		return &DocumentVerificationOutput{
+			AllValid:    len(invalidDocs) == 0,
+			InvalidDocs: invalidDocs,
+			VerifiedBy:  fmt.Sprintf("VERIFIER-%d", time.Now().Unix()%1000),
+		}, nil
+	},
+	flows.DefaultRetryPolicy,
+)
+
+// Activity 3: Risk Assessment
+var RiskAssessmentActivity = flows.NewActivity(
+	"risk-assessment",
+	func(ctx context.Context, input *RiskAssessmentInput) (*RiskAssessmentOutput, error) {
+		fmt.Printf("[RiskAssessment] Assessing risk for amount: $%.2f\n", input.Amount)
+
+		time.Sleep(400 * time.Millisecond)
+
+		// Business logic for risk assessment
+		requiresManager := false
+		approved := true
+		maxAmount := input.Amount
+		interestRate := 5.0
+
+		switch input.RiskLevel {
+		case "low":
+			interestRate = 4.5
+			if input.Amount > 500000 {
+				requiresManager = true
+			}
+		case "medium":
+			interestRate = 6.5
+			if input.Amount > 300000 {
+				requiresManager = true
+			}
+		case "high":
+			interestRate = 9.5
+			if input.Amount > 100000 {
+				requiresManager = true
+				maxAmount = 100000 // Cap the amount
+			} else {
+				approved = false
+			}
+		}
+
+		return &RiskAssessmentOutput{
+			Approved:        approved,
+			MaxAmount:       maxAmount,
+			InterestRate:    interestRate,
+			RequiresManager: requiresManager,
+		}, nil
+	},
+	flows.DefaultRetryPolicy,
+)
+
+// Activity 4: Fraud Check
+var FraudCheckActivity = flows.NewActivity(
+	"fraud-check",
+	func(ctx context.Context, input *FraudCheckInput) (*FraudCheckOutput, error) {
+		fmt.Printf("[FraudCheck] Checking fraud for applicant: %s\n", input.ApplicantID)
+
+		time.Sleep(600 * time.Millisecond)
+
+		// Simple fraud detection logic
+		suspicious := false
+		score := 100
+		reason := "Clean record"
+
+		// Suspicious if amount is too high
+		if input.Amount > 1000000 {
+			suspicious = true
+			score = 45
+			reason = "Unusually high loan amount"
+		}
+
+		return &FraudCheckOutput{
+			Suspicious: suspicious,
+			Score:      score,
+			Reason:     reason,
+		}, nil
+	},
+	flows.RetryPolicy{
+		InitialInterval: 2 * time.Second,
+		MaxInterval:     20 * time.Second,
+		BackoffFactor:   2.0,
+		MaxAttempts:     5,
+		Jitter:          0.2,
+	},
+)
+
+// Activity 5: Send Notification
+var SendNotificationActivity = flows.NewActivity(
+	"send-notification",
+	func(ctx context.Context, input *NotificationInput) (*NotificationOutput, error) {
+		fmt.Printf("[Notification] Sending %s to %s: %s\n",
+			input.Channel, input.ApplicantID, input.Message)
+
+		time.Sleep(200 * time.Millisecond)
+
+		return &NotificationOutput{
+			Sent:      true,
+			MessageID: fmt.Sprintf("MSG-%s", uuid.New().String()[:8]),
+		}, nil
+	},
+	flows.DefaultRetryPolicy,
+)
+
+var LoanApplicationWorkflow = flows.New(
+	"loan-application-workflow",
+	1,
+	func(ctx *flows.Context[LoanApplicationInput]) (*LoanApplicationOutput, error) {
+		input := ctx.Input()
+
+		// Generate deterministic application ID using UUIDv7
+		applicationID := ctx.UUIDv7()
+		fmt.Printf("\n=== Starting Loan Application: %s ===\n", applicationID)
+
+		// Track processing steps
+		approvalSteps := []string{}
+		startTime := ctx.Time()
+
+		// Step 1: Run fraud check and credit check in parallel concept
+		// (In reality, we run sequentially but demonstrate multiple activities)
+
+		// 1a. Fraud Check
+		approvalSteps = append(approvalSteps, "fraud-check-initiated")
+		fraudResult, err := flows.ExecuteActivity(ctx, FraudCheckActivity, &FraudCheckInput{
+			ApplicantID: input.ApplicantID,
+			Amount:      input.Amount,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fraud check failed: %w", err)
+		}
+
+		if fraudResult.Suspicious {
+			approvalSteps = append(approvalSteps, "fraud-detected")
+
+			// Send rejection notification
+			_, _ = flows.ExecuteActivity(ctx, SendNotificationActivity, &NotificationInput{
+				ApplicantID: input.ApplicantID,
+				Message:     fmt.Sprintf("Application rejected due to: %s", fraudResult.Reason),
+				Channel:     "email",
+			})
+
+			return &LoanApplicationOutput{
+				ApplicationID:  applicationID.String(),
+				Status:         "rejected",
+				DecisionReason: fraudResult.Reason,
+				ApprovalSteps:  approvalSteps,
+				ProcessingTime: ctx.Time().Sub(startTime),
+			}, nil
+		}
+		approvalSteps = append(approvalSteps, "fraud-check-passed")
+
+		// 1b. Credit Check
+		approvalSteps = append(approvalSteps, "credit-check-initiated")
+		creditResult, err := flows.ExecuteActivity(ctx, CreditCheckActivity, &CreditCheckInput{
+			ApplicantID: input.ApplicantID,
+			CreditScore: input.CreditScore,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("credit check failed: %w", err)
+		}
+		approvalSteps = append(approvalSteps,
+			fmt.Sprintf("credit-check-completed: risk=%s", creditResult.RiskLevel))
+
+		// Step 2: Document Verification Loop
+		// Simulate checking multiple documents
+		documentIDs := []string{
+			fmt.Sprintf("DOC-%s-1", input.ApplicantID),
+			fmt.Sprintf("DOC-%s-2", input.ApplicantID),
+			fmt.Sprintf("DOC-%s-3", input.ApplicantID),
+		}
+
+		// Loop through document batches (demonstrating loop in workflow)
+		allDocsValid := true
+		for i := 0; i < len(documentIDs); i += 2 {
+			batchEnd := i + 2
+			if batchEnd > len(documentIDs) {
+				batchEnd = len(documentIDs)
+			}
+			batch := documentIDs[i:batchEnd]
+
+			approvalSteps = append(approvalSteps,
+				fmt.Sprintf("verifying-documents-batch-%d", i/2+1))
+
+			docResult, err := flows.ExecuteActivity(ctx, DocumentVerificationActivity,
+				&DocumentVerificationInput{
+					ApplicantID: input.ApplicantID,
+					DocumentIDs: batch,
+				})
+			if err != nil {
+				return nil, fmt.Errorf("document verification failed: %w", err)
+			}
+
+			if !docResult.AllValid {
+				allDocsValid = false
+				approvalSteps = append(approvalSteps, "document-verification-failed")
+				break
+			}
+
+			// Small delay between batches using deterministic Sleep
+			if err := ctx.Sleep(500 * time.Millisecond); err != nil {
+				return nil, err
+			}
+		}
+
+		if !allDocsValid {
+			_, _ = flows.ExecuteActivity(ctx, SendNotificationActivity, &NotificationInput{
+				ApplicantID: input.ApplicantID,
+				Message:     "Application rejected: Invalid documents",
+				Channel:     "email",
+			})
+
+			return &LoanApplicationOutput{
+				ApplicationID:  applicationID.String(),
+				Status:         "rejected",
+				DecisionReason: "Document verification failed",
+				ApprovalSteps:  approvalSteps,
+				ProcessingTime: ctx.Time().Sub(startTime),
+			}, nil
+		}
+		approvalSteps = append(approvalSteps, "all-documents-verified")
+
+		// Step 3: Risk Assessment
+		approvalSteps = append(approvalSteps, "risk-assessment-initiated")
+		riskResult, err := flows.ExecuteActivity(ctx, RiskAssessmentActivity, &RiskAssessmentInput{
+			Amount:    input.Amount,
+			RiskLevel: creditResult.RiskLevel,
+			Purpose:   input.Purpose,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("risk assessment failed: %w", err)
+		}
+
+		// Conditional branching based on risk assessment
+		if !riskResult.Approved {
+			approvalSteps = append(approvalSteps, "auto-rejected-by-risk-assessment")
+
+			_, _ = flows.ExecuteActivity(ctx, SendNotificationActivity, &NotificationInput{
+				ApplicantID: input.ApplicantID,
+				Message:     "Application rejected: Risk assessment failed",
+				Channel:     "email",
+			})
+
+			return &LoanApplicationOutput{
+				ApplicationID:  applicationID.String(),
+				Status:         "rejected",
+				DecisionReason: "High risk profile",
+				ApprovalSteps:  approvalSteps,
+				ProcessingTime: ctx.Time().Sub(startTime),
+			}, nil
+		}
+		approvalSteps = append(approvalSteps, "risk-assessment-passed")
+
+		// Step 4: Manager Approval (if required) - Uses Signal
+		if riskResult.RequiresManager {
+			approvalSteps = append(approvalSteps, "manager-approval-required")
+
+			// Send notification to applicant
+			_, _ = flows.ExecuteActivity(ctx, SendNotificationActivity, &NotificationInput{
+				ApplicantID: input.ApplicantID,
+				Message:     "Your application requires manager approval. Please wait.",
+				Channel:     "email",
+			})
+
+			// Generate approval request ID
+			approvalRequestID := ctx.UUIDv7()
+			fmt.Printf("[Workflow] Waiting for manager approval: %s\n", approvalRequestID)
+
+			// Wait for manager signal (this pauses the workflow)
+			approvalSteps = append(approvalSteps, "waiting-for-manager-signal")
+			managerDecision, err := flows.WaitForSignal[LoanApplicationInput, ManagerApprovalSignal](
+				ctx, "manager-approval")
+			if err != nil {
+				return nil, fmt.Errorf("manager approval signal failed: %w", err)
+			}
+
+			if !managerDecision.Approved {
+				approvalSteps = append(approvalSteps,
+					fmt.Sprintf("manager-rejected-by-%s", managerDecision.ManagerID))
+
+				_, _ = flows.ExecuteActivity(ctx, SendNotificationActivity, &NotificationInput{
+					ApplicantID: input.ApplicantID,
+					Message: fmt.Sprintf("Application rejected by manager: %s",
+						managerDecision.Comments),
+					Channel: "email",
+				})
+
+				return &LoanApplicationOutput{
+					ApplicationID:  applicationID.String(),
+					Status:         "rejected",
+					DecisionReason: fmt.Sprintf("Manager rejection: %s", managerDecision.Comments),
+					ApprovalSteps:  approvalSteps,
+					ProcessingTime: ctx.Time().Sub(startTime),
+				}, nil
+			}
+			approvalSteps = append(approvalSteps,
+				fmt.Sprintf("manager-approved-by-%s", managerDecision.ManagerID))
+		}
+
+		// Step 5: Final Processing with Random Assignment
+		// Use deterministic random to assign loan officer
+		loanOfficerID := ctx.Random().Intn(5) + 1
+		approvalSteps = append(approvalSteps,
+			fmt.Sprintf("assigned-to-officer-%d", loanOfficerID))
+
+		// Simulate final processing delay
+		fmt.Println("[Workflow] Finalizing loan approval...")
+		if err := ctx.Sleep(2 * time.Second); err != nil {
+			return nil, err
+		}
+
+		// Step 6: Send approval notification
+		approvalSteps = append(approvalSteps, "sending-approval-notification")
+		_, err = flows.ExecuteActivity(ctx, SendNotificationActivity, &NotificationInput{
+			ApplicantID: input.ApplicantID,
+			Message: fmt.Sprintf(
+				"Congratulations! Your loan of $%.2f has been approved at %.2f%% interest rate.",
+				riskResult.MaxAmount, riskResult.InterestRate),
+			Channel: "email",
+		})
+		if err != nil {
+			// Notification failure shouldn't fail the workflow
+			fmt.Printf("[Warning] Failed to send notification: %v\n", err)
+		}
+
+		// Record completion time
+		completionTime := ctx.Time()
+		approvalSteps = append(approvalSteps, "loan-approved")
+
+		fmt.Printf("=== Loan Application Completed: %s ===\n\n", applicationID)
+
+		return &LoanApplicationOutput{
+			ApplicationID:  applicationID.String(),
+			Status:         "approved",
+			ApprovedAmount: riskResult.MaxAmount,
+			InterestRate:   riskResult.InterestRate,
+			ApprovalSteps:  approvalSteps,
+			ProcessingTime: completionTime.Sub(startTime),
+			DecisionReason: fmt.Sprintf("Approved by system with %s risk level",
+				creditResult.RiskLevel),
+		}, nil
+	},
+)

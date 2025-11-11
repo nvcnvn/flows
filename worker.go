@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"reflect"
 	"sync"
 	"time"
 
@@ -263,7 +262,7 @@ func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueu
 		actModel.Error = execErr.Error()
 
 		// Get retry policy from activity definition
-		retryPolicy := w.getActivityRetryPolicy(activityEntry.activity)
+		retryPolicy := w.getActivityRetryPolicy(activityEntry)
 
 		// Check if max attempts exceeded
 		if actModel.Attempt >= retryPolicy.MaxAttempts {
@@ -449,73 +448,60 @@ func (w *Worker) executeWorkflow(
 		}
 	}
 
-	// 3. Create workflow context with pause function using the factory
+	// 3. Execute workflow with pause function
 	var pauseErr error
-	var currentSequenceNum int
 	pauseFunc := func() error {
 		pauseErr = ErrWorkflowPaused
 		panic(ErrWorkflowPaused)
 	}
 
-	wfCtx := workflowEntry.contextFactory(
-		ctx,
-		workflowID,
-		tenantID,
-		input,
-		wfModel.SequenceNum,
-		wfModel.Name,
-		w.store,
-		pauseFunc,
-		activityResults,
-		activityErrors,
-		timerResults,
-		timeResults,
-		signalResults,
-	)
-
 	// 4. Execute workflow function with panic/recover
-	defer func() {
-		if r := recover(); r != nil {
-			// Check if it's our expected pause
-			if err, ok := r.(error); ok && err == ErrWorkflowPaused {
-				// Workflow paused for activity/timer/signal - this is normal
-				// The activity/timer/signal has been scheduled
-				pauseErr = ErrWorkflowPaused
-			} else {
-				// Unexpected panic - mark workflow as failed
-				panicErr := fmt.Errorf("workflow panicked: %v", r)
-				if err := w.failWorkflow(ctx, tenantID, workflowID, panicErr); err != nil {
-					fmt.Printf("Failed to mark workflow as failed: %v\n", err)
+	var output interface{}
+	var finalSequenceNum int
+	var execErr error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Check if it's our expected pause
+				if err, ok := r.(error); ok && err == ErrWorkflowPaused {
+					// Workflow paused for activity/timer/signal - this is normal
+					// The activity/timer/signal has been scheduled
+					pauseErr = ErrWorkflowPaused
+				} else {
+					// Unexpected panic - mark workflow as failed
+					panicErr := fmt.Errorf("workflow panicked: %v", r)
+					if err := w.failWorkflow(ctx, tenantID, workflowID, panicErr); err != nil {
+						fmt.Printf("Failed to mark workflow as failed: %v\n", err)
+					}
 				}
 			}
-		}
+		}()
+
+		// Execute workflow directly using the type-erased execute function
+		// Returns: output, finalSequenceNum, error
+		output, finalSequenceNum, execErr = workflowEntry.execute(
+			ctx,
+			workflowID,
+			tenantID,
+			input,
+			wfModel.SequenceNum,
+			wfModel.Name,
+			w.store,
+			pauseFunc,
+			activityResults,
+			activityErrors,
+			timerResults,
+			timeResults,
+			signalResults,
+		)
 	}()
-
-	// Call Execute method on workflow using reflection (only for the Execute call)
-	wfVal := reflect.ValueOf(workflowEntry.workflow)
-	executeMethod := wfVal.MethodByName("Execute")
-	if !executeMethod.IsValid() {
-		return fmt.Errorf("workflow does not have Execute method")
-	}
-
-	results := executeMethod.Call([]reflect.Value{reflect.ValueOf(wfCtx)})
-	if len(results) != 2 {
-		return fmt.Errorf("Execute method should return 2 values")
-	}
 
 	// Check if workflow was paused
 	if pauseErr == ErrWorkflowPaused {
 		// Workflow paused - save current sequence number
-		// Extract sequence number from context using type assertion
-		// We know the context implements a common interface or has sequenceNum field
-		ctxVal := reflect.ValueOf(wfCtx)
-		if ctxVal.Kind() == reflect.Ptr {
-			ctxVal = ctxVal.Elem()
-		}
-		seqNumField := ctxVal.FieldByName("sequenceNum")
-		if seqNumField.IsValid() {
-			currentSequenceNum = int(seqNumField.Int())
-		}
+		// The execute function returns the updated sequenceNum
+		currentSequenceNum := finalSequenceNum
 
 		// Serialize activity results to save
 		activityResultsJSON, err := json.Marshal(activityResults)
@@ -530,13 +516,11 @@ func (w *Worker) executeWorkflow(
 	}
 
 	// 5. Workflow completed - check for error
-	if !results[1].IsNil() {
-		err := results[1].Interface().(error)
-		return w.failWorkflow(ctx, tenantID, workflowID, err)
+	if execErr != nil {
+		return w.failWorkflow(ctx, tenantID, workflowID, execErr)
 	}
 
 	// 6. Serialize and save output
-	output := results[0].Interface()
 	outputData, err := json.Marshal(output)
 	if err != nil {
 		return w.failWorkflow(ctx, tenantID, workflowID, fmt.Errorf("failed to serialize output: %w", err))
@@ -589,31 +573,13 @@ func (w *Worker) executeActivity(
 	// Create activity context
 	activityCtx := NewActivityContext(ctx, workflowID, activityID, tenantID, actModel.Attempt)
 
-	// Use reflection to call the Execute method on the activity
-	actVal := reflect.ValueOf(activityEntry.activity)
-	executeMethod := actVal.MethodByName("Execute")
-	if !executeMethod.IsValid() {
-		return nil, fmt.Errorf("activity does not have Execute method")
-	}
-
-	// Call Execute(ctx, input)
-	results := executeMethod.Call([]reflect.Value{
-		reflect.ValueOf(activityCtx.ctx),
-		reflect.ValueOf(input),
-	})
-
-	if len(results) != 2 {
-		return nil, fmt.Errorf("Execute method should return 2 values")
-	}
-
-	// Check for error
-	if !results[1].IsNil() {
-		err := results[1].Interface().(error)
+	// Execute activity directly using the type-erased execute function
+	output, err := activityEntry.execute(activityCtx.ctx, input)
+	if err != nil {
 		return nil, err
 	}
 
 	// Serialize output
-	output := results[0].Interface()
 	outputData, err := json.Marshal(output)
 	if err != nil {
 		return nil, NewTerminalError(fmt.Errorf("failed to serialize output: %w", err))
@@ -623,24 +589,8 @@ func (w *Worker) executeActivity(
 }
 
 // getActivityRetryPolicy extracts retry policy from activity definition.
-func (w *Worker) getActivityRetryPolicy(activityDef interface{}) RetryPolicy {
-	actVal := reflect.ValueOf(activityDef)
-	retryPolicyMethod := actVal.MethodByName("RetryPolicy")
-	if !retryPolicyMethod.IsValid() {
-		return DefaultRetryPolicy
-	}
-
-	results := retryPolicyMethod.Call(nil)
-	if len(results) != 1 {
-		return DefaultRetryPolicy
-	}
-
-	policy, ok := results[0].Interface().(RetryPolicy)
-	if !ok {
-		return DefaultRetryPolicy
-	}
-
-	return policy
+func (w *Worker) getActivityRetryPolicy(activityEntry *ActivityRegistryEntry) RetryPolicy {
+	return activityEntry.retryPolicy
 }
 
 // calculateBackoff calculates the backoff duration for retry.

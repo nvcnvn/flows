@@ -2,6 +2,7 @@ package flows
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/nvcnvn/flows/internal/registry"
@@ -16,11 +17,12 @@ type Activity[In, Out any] struct {
 	outputType  registry.TypeInfo
 }
 
-// ActivityRegistryEntry stores the activity definition along with type information.
+// ActivityRegistryEntry stores activity metadata and execution function.
 type ActivityRegistryEntry struct {
-	activity   interface{} // *Activity[In, Out]
-	inputType  registry.TypeInfo
-	outputType registry.TypeInfo
+	inputType   registry.TypeInfo
+	outputType  registry.TypeInfo
+	retryPolicy RetryPolicy
+	execute     func(context.Context, interface{}) (interface{}, error) // Type-erased execution function
 }
 
 // ActivityRegistry stores registered activities for execution.
@@ -50,11 +52,21 @@ func NewActivity[In, Out any](
 		outputType:  outputType,
 	}
 
-	// Register activity in global registry with type information
+	// Create type-erased execution function
+	executeFunc := func(ctx context.Context, input interface{}) (interface{}, error) {
+		typedInput, ok := input.(*In)
+		if !ok {
+			return nil, NewTerminalError(fmt.Errorf("input type mismatch: expected *%s, got %T", inputType.Name, input))
+		}
+		return fn(ctx, typedInput)
+	}
+
+	// Register activity in global registry with execution function
 	globalActivityRegistry.activities[name] = &ActivityRegistryEntry{
-		activity:   act,
-		inputType:  inputType,
-		outputType: outputType,
+		inputType:   inputType,
+		outputType:  outputType,
+		retryPolicy: retryPolicy,
+		execute:     executeFunc,
 	}
 
 	return act

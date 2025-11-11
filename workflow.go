@@ -21,13 +21,11 @@ type Workflow[In, Out any] struct {
 	outputType registry.TypeInfo
 }
 
-// WorkflowRegistryEntry stores both the workflow definition and a factory function
-// to create properly typed contexts without reflection.
+// WorkflowRegistryEntry stores workflow metadata and execution function.
 type WorkflowRegistryEntry struct {
-	workflow       interface{}                                                                                                                                                                                                       // *Workflow[In, Out]
-	inputType      registry.TypeInfo                                                                                                                                                                                                 // Type information for input
-	outputType     registry.TypeInfo                                                                                                                                                                                                 // Type information for output
-	contextFactory func(context.Context, uuid.UUID, uuid.UUID, interface{}, int, string, *storage.Store, func() error, map[int]interface{}, map[int]error, map[int]time.Time, map[int]time.Time, map[string]interface{}) interface{} // Factory to create Context[In]
+	inputType  registry.TypeInfo                                                                                                                                                                                                               // Type information for input
+	outputType registry.TypeInfo                                                                                                                                                                                                               // Type information for output
+	execute    func(context.Context, uuid.UUID, uuid.UUID, interface{}, int, string, *storage.Store, func() error, map[int]interface{}, map[int]error, map[int]time.Time, map[int]time.Time, map[string]interface{}) (interface{}, int, error) // Type-erased execution function - returns (output, finalSequenceNum, error)
 }
 
 // WorkflowRegistry stores registered workflows for execution.
@@ -53,8 +51,8 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 		outputType: outputType,
 	}
 
-	// Create a factory function that knows how to create Context[In]
-	contextFactory := func(
+	// Create a type-erased execution function that constructs Context[In] and executes the workflow
+	executeFunc := func(
 		ctx context.Context,
 		workflowID uuid.UUID,
 		tenantID uuid.UUID,
@@ -68,20 +66,20 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 		timerResults map[int]time.Time,
 		timeResults map[int]time.Time,
 		signalResults map[string]interface{},
-	) interface{} {
+	) (interface{}, int, error) {
 		// Cast input to the correct type
 		typedInput, ok := input.(*In)
 		if !ok {
 			// This should never happen if deserialization worked correctly
-			panic(fmt.Sprintf("input type mismatch: expected *%s, got %T", inputType.Name, input))
+			return nil, 0, fmt.Errorf("input type mismatch: expected *%s, got %T", inputType.Name, input)
 		}
 
 		// Create deterministic random generator
 		seed := int64(workflowID.ID())
 		rnd := rand.New(rand.NewSource(seed))
 
-		// Return properly typed Context[In]
-		return &Context[In]{
+		// Construct Context[In] directly
+		wfCtx := &Context[In]{
 			ctx:             ctx,
 			workflowID:      workflowID,
 			tenantID:        tenantID,
@@ -97,14 +95,18 @@ func New[In, Out any](name string, version int, fn func(*Context[In]) (*Out, err
 			rnd:             rnd,
 			pauseFunc:       pauseFunc,
 		}
+
+		// Execute workflow function directly (no reflection needed)
+		output, err := fn(wfCtx)
+		// Return output, final sequence number, and error
+		return output, wfCtx.sequenceNum, err
 	}
 
-	// Register workflow in global registry with its factory
+	// Register workflow in global registry with execution function
 	globalWorkflowRegistry.workflows[name] = &WorkflowRegistryEntry{
-		workflow:       wf,
-		inputType:      inputType,
-		outputType:     outputType,
-		contextFactory: contextFactory,
+		inputType:  inputType,
+		outputType: outputType,
+		execute:    executeFunc,
 	}
 
 	return wf
@@ -157,34 +159,6 @@ type Context[T any] struct {
 
 	// Pause function (set by executor)
 	pauseFunc func() error
-}
-
-// newContext creates a new workflow context.
-func newContext[T any](
-	ctx context.Context,
-	workflowID uuid.UUID,
-	tenantID uuid.UUID,
-	input *T,
-	sequenceNum int,
-	pauseFunc func() error,
-) *Context[T] {
-	// Create deterministic random generator
-	seed := int64(workflowID.ID())
-	rnd := rand.New(rand.NewSource(seed))
-
-	return &Context[T]{
-		ctx:             ctx,
-		workflowID:      workflowID,
-		tenantID:        tenantID,
-		input:           input,
-		sequenceNum:     sequenceNum,
-		activityResults: make(map[int]interface{}),
-		timerResults:    make(map[int]time.Time),
-		timeResults:     make(map[int]time.Time),
-		signalResults:   make(map[string]interface{}),
-		rnd:             rnd,
-		pauseFunc:       pauseFunc,
-	}
 }
 
 // Context returns the underlying Go context.
