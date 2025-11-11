@@ -2,6 +2,7 @@ package flows
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -151,6 +152,7 @@ type WorkflowInfo struct {
 	Version  int
 	Status   WorkflowStatus
 	Error    string
+	Output   json.RawMessage // Raw JSON output (only set when status is completed)
 }
 
 // ActivityInfo contains metadata about an activity execution.

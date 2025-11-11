@@ -199,7 +199,7 @@ func TestMultiTenantIsolation(t *testing.T) {
 	}
 
 	// Verify tenant isolation - tenant 1 should not see tenant 2's workflow
-	status, err := flows.Query(ctx1, exec2.WorkflowID(), exec2.WorkflowName())
+	status, err := flows.Query(ctx1, exec2.WorkflowName(), exec2.WorkflowID())
 	assert.Error(t, err, "Should not be able to query other tenant's workflow")
 	assert.Nil(t, status, "Status should be nil for cross-tenant query")
 }
@@ -356,31 +356,31 @@ func TestMultiTenantSignalIsolation(t *testing.T) {
 	}()
 
 	require.Eventually(t, func() bool {
-		status1, err := flows.Query(ctx1, exec1.WorkflowID(), exec1.WorkflowName())
+		status1, err := flows.Query(ctx1, exec1.WorkflowName(), exec1.WorkflowID())
 		if err != nil {
 			return false
 		}
-		status2, err := flows.Query(ctx2, exec2.WorkflowID(), exec2.WorkflowName())
+		status2, err := flows.Query(ctx2, exec2.WorkflowName(), exec2.WorkflowID())
 		if err != nil {
 			return false
 		}
 		return status1.Status == flows.StatusRunning && status2.Status == flows.StatusRunning
 	}, 10*time.Second, 200*time.Millisecond, "workflows should be running before signaling")
 
-	err = flows.SendSignal(ctx1, exec2.WorkflowID(), exec2.WorkflowName(), "tenant-ready", &TenantSignalPayload{
+	err = flows.SendSignal(ctx1, exec2.WorkflowName(), exec2.WorkflowID(), "tenant-ready", &TenantSignalPayload{
 		TenantID: tenant1,
 		Message:  "wrong-tenant",
 	})
 	require.Error(t, err, "cross-tenant signal should be rejected")
 	assert.Contains(t, err.Error(), "failed to get workflow")
 
-	err = flows.SendSignal(ctx1, exec1.WorkflowID(), exec1.WorkflowName(), "tenant-ready", &TenantSignalPayload{
+	err = flows.SendSignal(ctx1, exec1.WorkflowName(), exec1.WorkflowID(), "tenant-ready", &TenantSignalPayload{
 		TenantID: tenant1,
 		Message:  "ack-tenant1",
 	})
 	require.NoError(t, err)
 
-	err = flows.SendSignal(ctx2, exec2.WorkflowID(), exec2.WorkflowName(), "tenant-ready", &TenantSignalPayload{
+	err = flows.SendSignal(ctx2, exec2.WorkflowName(), exec2.WorkflowID(), "tenant-ready", &TenantSignalPayload{
 		TenantID: tenant2,
 		Message:  "ack-tenant2",
 	})
@@ -433,11 +433,11 @@ func TestMultiTenantSignalIsolation(t *testing.T) {
 		t.Fatal("tenant 2 workflow did not complete in time")
 	}
 
-	status1, err := flows.Query(ctx1, exec1.WorkflowID(), exec1.WorkflowName())
+	status1, err := flows.Query(ctx1, exec1.WorkflowName(), exec1.WorkflowID())
 	require.NoError(t, err)
 	assert.Equal(t, flows.StatusCompleted, status1.Status)
 
-	status2, err := flows.Query(ctx2, exec2.WorkflowID(), exec2.WorkflowName())
+	status2, err := flows.Query(ctx2, exec2.WorkflowName(), exec2.WorkflowID())
 	require.NoError(t, err)
 	assert.Equal(t, flows.StatusCompleted, status2.Status)
 }

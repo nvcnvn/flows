@@ -194,7 +194,7 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Send warehouse confirmation signal
-	err = flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "warehouse-ready", &WarehouseConfirmation{
+	err = flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
 		OrderID:   exec.WorkflowID().String(),
 		Available: true,
 	})
@@ -202,7 +202,7 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 	t.Log("Signal sent successfully")
 
 	// Query workflow status
-	status, err := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
+	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err, "Failed to query workflow")
 	t.Logf("Workflow status: %+v", status)
 
@@ -289,7 +289,7 @@ func TestOrderWorkflow_WithTransaction(t *testing.T) {
 	// Wait and send signal
 	time.Sleep(2 * time.Second)
 
-	err = flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "warehouse-ready", &WarehouseConfirmation{
+	err = flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
 		OrderID:   exec.WorkflowID().String(),
 		Available: true,
 	})
@@ -365,7 +365,7 @@ func TestOrderWorkflow_SignalTimeout(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Query status - should be waiting for signal
-	status, err := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
+	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err, "Failed to query workflow")
 	t.Logf("Workflow status (waiting for signal): %+v", status)
 
@@ -393,7 +393,7 @@ func TestOrderWorkflow_SignalBeforeWorker(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "warehouse-ready", &WarehouseConfirmation{
+	err = flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
 		OrderID:   exec.WorkflowID().String(),
 		Available: true,
 	})
@@ -438,7 +438,7 @@ func TestOrderWorkflow_SignalBeforeWorker(t *testing.T) {
 		t.Fatal("workflow did not complete")
 	}
 
-	status, err := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
+	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err)
 	assert.Equal(t, flows.StatusCompleted, status.Status)
 }

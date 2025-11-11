@@ -17,20 +17,22 @@ import (
 
 // Worker polls and executes workflow tasks.
 type Worker struct {
-	store  *storage.Store
-	config WorkerConfig
-	stopCh chan struct{}
-	doneCh chan struct{}
-	wg     sync.WaitGroup
+	store    *storage.Store
+	config   WorkerConfig
+	hashRing *ConsistentHash
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	wg       sync.WaitGroup
 }
 
 // WorkerConfig configures worker behavior.
 type WorkerConfig struct {
-	Concurrency       int           // Number of concurrent task handlers
-	WorkflowNames     []string      // Workflow types to handle
-	PollInterval      time.Duration // Poll frequency
-	VisibilityTimeout time.Duration // Task lock duration
-	TenantID          uuid.UUID     // Tenant to work for
+	Concurrency       int             // Number of concurrent task handlers
+	WorkflowNames     []string        // Workflow types to handle
+	PollInterval      time.Duration   // Poll frequency
+	VisibilityTimeout time.Duration   // Task lock duration
+	TenantID          uuid.UUID       // Tenant to work for
+	HashRing          *ConsistentHash // Optional custom hash ring (uses global if nil)
 }
 
 // NewWorker creates a new worker instance.
@@ -48,19 +50,26 @@ func NewWorker(pool *pgxpool.Pool, config WorkerConfig) *Worker {
 		config.VisibilityTimeout = 5 * time.Minute
 	}
 
+	// Use provided hash ring or global
+	hashRing := config.HashRing
+	if hashRing == nil {
+		hashRing = getGlobalHashRing()
+	}
+
 	// Expand workflow names to include all shards
 	var expandedNames []string
 	for _, baseName := range config.WorkflowNames {
-		shardedNames := GetAllShardedWorkflowNames(baseName)
+		shardedNames := getAllShardedWorkflowNames(baseName, hashRing)
 		expandedNames = append(expandedNames, shardedNames...)
 	}
 	config.WorkflowNames = expandedNames
 
 	return &Worker{
-		store:  storage.NewStore(pool),
-		config: config,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+		store:    storage.NewStore(pool),
+		config:   config,
+		hashRing: hashRing,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
 	}
 }
 
@@ -197,7 +206,7 @@ func (w *Worker) processWorkflowTask(ctx context.Context, task *storage.TaskQueu
 	}
 
 	// Extract base workflow name (remove shard suffix)
-	baseName := ExtractBaseWorkflowName(wfModel.Name)
+	baseName := extractBaseWorkflowName(wfModel.Name)
 
 	// Get workflow definition from registry using base name (thread-safe)
 	workflowEntry, ok := globalWorkflowRegistry.get(baseName)

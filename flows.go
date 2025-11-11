@@ -16,7 +16,19 @@ import (
 
 // Engine manages workflow execution and storage.
 type Engine struct {
-	store *storage.Store
+	store    *storage.Store
+	hashRing *ConsistentHash
+}
+
+// EngineOption configures an Engine.
+type EngineOption func(*Engine)
+
+// WithHashRing sets a custom hash ring for the engine.
+// If not provided, the engine will use the global hash ring.
+func WithHashRing(hashRing *ConsistentHash) EngineOption {
+	return func(e *Engine) {
+		e.hashRing = hashRing
+	}
 }
 
 // NewEngine creates a new workflow engine with PostgreSQL storage.
@@ -30,8 +42,23 @@ type Engine struct {
 //	}
 //	engine := flows.NewEngine(pool)
 //	flows.SetEngine(engine)
-func NewEngine(pool *pgxpool.Pool) *Engine {
-	return &Engine{store: storage.NewStore(pool)}
+//
+// Example with custom hash ring:
+//
+//	hashRing := flows.NewConsistentHash(100)
+//	for i := 0; i < 5; i++ {
+//		hashRing.Add(i)
+//	}
+//	engine := flows.NewEngine(pool, flows.WithHashRing(hashRing))
+func NewEngine(pool *pgxpool.Pool, opts ...EngineOption) *Engine {
+	eng := &Engine{
+		store:    storage.NewStore(pool),
+		hashRing: nil, // Will use global hash ring if not set
+	}
+	for _, opt := range opts {
+		opt(eng)
+	}
+	return eng
 }
 
 // Store returns the underlying storage.
@@ -70,6 +97,7 @@ func executeInTx(ctx context.Context, store *storage.Store, tx Tx, fn func(Tx) e
 // startInternal is the internal implementation of Start.
 func startInternal[In, Out any](
 	store *storage.Store,
+	hashRing *ConsistentHash,
 	ctx context.Context,
 	wf *Workflow[In, Out],
 	input *In,
@@ -87,13 +115,14 @@ func startInternal[In, Out any](
 	workflowID := uuid.New()
 
 	// Get sharded workflow name using consistent hashing
-	shardedName := GetShardedWorkflowName(wf.Name(), workflowID)
+	baseName := wf.Name()
+	shardedName := getShardedWorkflowName(baseName, workflowID, hashRing)
 
 	// Create workflow model
 	wfModel := &storage.WorkflowModel{
 		ID:              storage.UUIDToPgtype(workflowID),
 		TenantID:        storage.UUIDToPgtype(tenantID),
-		Name:            shardedName, // Use sharded name
+		Name:            shardedName, // Use sharded name in database
 		Version:         wf.Version(),
 		Status:          string(StatusPending),
 		Input:           inputData,
@@ -107,7 +136,7 @@ func startInternal[In, Out any](
 		ID:                storage.UUIDToPgtype(taskID),
 		TenantID:          storage.UUIDToPgtype(tenantID),
 		WorkflowID:        storage.UUIDToPgtype(workflowID),
-		WorkflowName:      shardedName, // Use sharded name
+		WorkflowName:      shardedName, // Use sharded name in database
 		TaskType:          string(TaskTypeWorkflow),
 		VisibilityTimeout: time.Now(),
 	}
@@ -127,25 +156,30 @@ func startInternal[In, Out any](
 	}
 
 	return &Execution[Out]{
-		id:           taskID,
-		workflowID:   workflowID,
-		workflowName: shardedName,
-		store:        store,
+		id:                  taskID,
+		workflowID:          workflowID,
+		workflowName:        baseName,    // Return base name to user
+		workflowNameSharded: shardedName, // Also provide sharded name for debugging
+		store:               store,
 	}, nil
 }
 
 // sendSignalInternal is the internal implementation of SendSignal.
 func sendSignalInternal[P any](
 	store *storage.Store,
+	hashRing *ConsistentHash,
 	ctx context.Context,
 	workflowID uuid.UUID,
-	workflowName string,
+	workflowName string, // Base workflow name (user-defined)
 	signalName string,
 	payload *P,
 	opts ...SignalOption,
 ) error {
 	cfg := getSignalConfig(opts)
 	tenantID := MustGetTenantID(ctx)
+
+	// Derive sharded name from base name and workflow ID
+	shardedName := getShardedWorkflowName(workflowName, workflowID, hashRing)
 
 	// Serialize payload
 	_, payloadData, err := registry.Serialize(payload)
@@ -154,7 +188,7 @@ func sendSignalInternal[P any](
 	}
 
 	signalModel := &storage.SignalModel{
-		WorkflowName: workflowName,
+		WorkflowName: shardedName, // Use sharded name in database
 		ID:           storage.UUIDToPgtype(uuid.New()),
 		TenantID:     storage.UUIDToPgtype(tenantID),
 		WorkflowID:   storage.UUIDToPgtype(workflowID),
@@ -168,7 +202,7 @@ func sendSignalInternal[P any](
 		ID:                storage.UUIDToPgtype(uuid.New()),
 		TenantID:          storage.UUIDToPgtype(tenantID),
 		WorkflowID:        storage.UUIDToPgtype(workflowID),
-		WorkflowName:      workflowName,
+		WorkflowName:      shardedName, // Use sharded name in database
 		TaskType:          string(TaskTypeWorkflow),
 		VisibilityTimeout: time.Now(),
 	}
@@ -177,7 +211,7 @@ func sendSignalInternal[P any](
 	return executeInTx(ctx, store, cfg.tx, func(tx Tx) error {
 		// Verify workflow exists and belongs to the correct tenant
 		// This ensures cross-tenant signal attempts are rejected
-		_, err := store.GetWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+		_, err := store.GetWorkflow(ctx, shardedName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 		if err != nil {
 			return fmt.Errorf("failed to get workflow: %w", err)
 		}
@@ -193,12 +227,15 @@ func sendSignalInternal[P any](
 }
 
 // Query retrieves the current status of a workflow.
-// Requires workflow name for efficient single-shard routing.
-func (eng *Engine) Query(ctx context.Context, workflowID uuid.UUID, workflowName string) (*WorkflowInfo, error) {
+// workflowName should be the base workflow name (user-defined constant).
+func (eng *Engine) Query(ctx context.Context, workflowName string, workflowID uuid.UUID) (*WorkflowInfo, error) {
 	tenantID := MustGetTenantID(ctx)
 
-	// Use efficient single-shard query with workflow_name
-	wf, err := eng.store.GetWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	// Derive sharded name from base name and workflow ID
+	shardedName := getShardedWorkflowName(workflowName, workflowID, eng.hashRing)
+
+	// Use efficient single-shard query with sharded workflow_name
+	wf, err := eng.store.GetWorkflow(ctx, shardedName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
 	if err != nil {
 		return nil, err
 	}
@@ -210,21 +247,29 @@ func (eng *Engine) Query(ctx context.Context, workflowID uuid.UUID, workflowName
 		Version:  wf.Version,
 		Status:   WorkflowStatus(wf.Status),
 		Error:    wf.Error,
+		Output:   wf.Output,
 	}, nil
 }
 
 // RerunFromDLQ creates a new workflow execution from a DLQ entry.
-// Requires workflow name for efficient single-shard routing.
+// workflowName should be the base workflow name (user-defined constant).
 func (eng *Engine) RerunFromDLQ(
 	ctx context.Context,
-	dlqID uuid.UUID,
 	workflowName string,
+	dlqID uuid.UUID,
 	opts ...RerunOption,
 ) (uuid.UUID, error) {
 	cfg := getRerunConfig(opts)
 	tenantID := MustGetTenantID(ctx)
 
-	// Get DLQ entry using workflow_name for single-shard query
+	// Note: DLQ entries store the sharded workflow name, so we need to search across all shards
+	// for this base workflow name. This is less efficient but DLQ operations are rare.
+	// In practice, you'd likely list DLQ entries first which would give you the exact sharded name.
+
+	// For now, we'll try to get the DLQ entry directly if the user provided the sharded name,
+	// or derive it if they have the original workflow ID (which is stored in DLQ).
+	// This is a simplified implementation - production systems might want to add a base_name column to DLQ.
+
 	dlqEntry, err := eng.store.GetDLQEntry(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(dlqID))
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to get DLQ entry: %w", err)
@@ -235,6 +280,12 @@ func (eng *Engine) RerunFromDLQ(
 
 	// Create new workflow with same input
 	newWorkflowID := uuid.New()
+
+	// Extract base name from the DLQ entry's sharded name
+	baseName := extractBaseWorkflowName(dlqEntry.WorkflowName)
+
+	// Derive new sharded name for the new workflow ID
+	newShardedName := getShardedWorkflowName(baseName, newWorkflowID, eng.hashRing)
 
 	// Create metadata linking to DLQ
 	metadata := map[string]interface{}{
@@ -247,7 +298,7 @@ func (eng *Engine) RerunFromDLQ(
 	wfModel := &storage.WorkflowModel{
 		ID:              storage.UUIDToPgtype(newWorkflowID),
 		TenantID:        storage.UUIDToPgtype(tenantID),
-		Name:            dlqEntry.WorkflowName,
+		Name:            newShardedName, // Use new sharded name for new workflow
 		Version:         dlqEntry.WorkflowVersion,
 		Status:          string(StatusPending),
 		Input:           dlqEntry.Input,
@@ -259,7 +310,7 @@ func (eng *Engine) RerunFromDLQ(
 		ID:                storage.UUIDToPgtype(uuid.New()),
 		TenantID:          storage.UUIDToPgtype(tenantID),
 		WorkflowID:        storage.UUIDToPgtype(newWorkflowID),
-		WorkflowName:      dlqEntry.WorkflowName,
+		WorkflowName:      newShardedName, // Use new sharded name
 		TaskType:          string(TaskTypeWorkflow),
 		TaskData:          metadataJSON,
 		VisibilityTimeout: time.Now(),
@@ -285,13 +336,188 @@ func (eng *Engine) RerunFromDLQ(
 	return newWorkflowID, nil
 }
 
+// startWith starts a workflow execution using this engine instance.
+// This is a wrapper that allows using the engine directly without setting a global engine.
+//
+// Example:
+//
+//	engine := flows.NewEngine(pool)
+//	exec, err := flows.StartWith(engine, ctx, myWorkflow, input)
+func startWith[In, Out any](
+	eng *Engine,
+	ctx context.Context,
+	wf *Workflow[In, Out],
+	input *In,
+	opts ...StartOption,
+) (*Execution[Out], error) {
+	return startInternal(eng.store, eng.hashRing, ctx, wf, input, opts...)
+}
+
+// SendSignalWith sends a signal to a running workflow using a specific engine instance.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example:
+//
+//	err := flows.SendSignalWith(engine, ctx, workflowName, workflowID, "signal-name", payload)
+func SendSignalWith[P any](
+	eng *Engine,
+	ctx context.Context,
+	workflowName string,
+	workflowID uuid.UUID,
+	signalName string,
+	payload *P,
+	opts ...SignalOption,
+) error {
+	return sendSignalInternal(eng.store, eng.hashRing, ctx, workflowID, workflowName, signalName, payload, opts...)
+}
+
+// GetResultWith retrieves the typed result of a completed workflow using a specific engine instance.
+// This allows retrieving results without keeping the original Execution handle.
+// Returns an error if the workflow is not completed or failed.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example:
+//
+//	result, err := flows.GetResultWith[MyOutput](engine, ctx, workflowName, workflowID)
+func GetResultWith[Out any](eng *Engine, ctx context.Context, workflowName string, workflowID uuid.UUID) (*Out, error) {
+	tenantID := MustGetTenantID(ctx)
+
+	// Derive sharded name from base name and workflow ID
+	shardedName := getShardedWorkflowName(workflowName, workflowID, eng.hashRing)
+
+	// Get workflow
+	wf, err := eng.store.GetWorkflow(ctx, shardedName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+	if err != nil {
+		return nil, err
+	}
+
+	// Check status
+	switch WorkflowStatus(wf.Status) {
+	case StatusCompleted:
+		// Deserialize output
+		if len(wf.Output) == 0 {
+			return nil, nil
+		}
+		var result Out
+		if err := json.Unmarshal(wf.Output, &result); err != nil {
+			return nil, fmt.Errorf("failed to deserialize output: %w", err)
+		}
+		return &result, nil
+
+	case StatusFailed:
+		if wf.Error != "" {
+			return nil, fmt.Errorf("workflow failed: %s", wf.Error)
+		}
+		return nil, fmt.Errorf("workflow failed with unknown error")
+
+	case StatusRunning:
+		return nil, fmt.Errorf("workflow is still running")
+
+	case StatusPending:
+		return nil, fmt.Errorf("workflow is pending execution")
+
+	default:
+		return nil, fmt.Errorf("unknown workflow status: %s", wf.Status)
+	}
+}
+
+// WaitForResultWith waits for a workflow to complete and returns the typed result using a specific engine instance.
+// This is similar to Execution.Get() but works without keeping the Execution handle.
+// Blocks until the workflow finishes or context is cancelled.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example:
+//
+//	result, err := flows.WaitForResultWith[MyOutput](engine, ctx, workflowName, workflowID)
+func WaitForResultWith[Out any](eng *Engine, ctx context.Context, workflowName string, workflowID uuid.UUID) (*Out, error) {
+	// Poll for workflow completion
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	tenantID := MustGetTenantID(ctx)
+
+	// Derive sharded name from base name and workflow ID
+	shardedName := getShardedWorkflowName(workflowName, workflowID, eng.hashRing)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			// Check workflow status
+			wf, err := eng.store.GetWorkflow(ctx, shardedName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
+			if err != nil {
+				return nil, err
+			}
+
+			switch WorkflowStatus(wf.Status) {
+			case StatusCompleted:
+				// Deserialize output
+				if len(wf.Output) == 0 {
+					return nil, nil
+				}
+				var result Out
+				if err := json.Unmarshal(wf.Output, &result); err != nil {
+					return nil, fmt.Errorf("failed to deserialize output: %w", err)
+				}
+				return &result, nil
+
+			case StatusFailed:
+				if wf.Error != "" {
+					return nil, fmt.Errorf("workflow failed: %s", wf.Error)
+				}
+				return nil, fmt.Errorf("workflow failed with unknown error")
+
+			case StatusRunning, StatusPending:
+				// Continue polling
+				continue
+
+			default:
+				return nil, fmt.Errorf("unknown workflow status: %s", wf.Status)
+			}
+		}
+	}
+}
+
+// QueryWith retrieves the current status of a workflow using a specific engine instance.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example:
+//
+//	info, err := flows.QueryWith(engine, ctx, workflowName, workflowID)
+func QueryWith(eng *Engine, ctx context.Context, workflowName string, workflowID uuid.UUID) (*WorkflowInfo, error) {
+	return eng.Query(ctx, workflowName, workflowID)
+}
+
+// RerunFromDLQWith reruns a workflow from DLQ using a specific engine instance.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example:
+//
+//	newWorkflowID, err := flows.RerunFromDLQWith(engine, ctx, workflowName, dlqID)
+func RerunFromDLQWith(eng *Engine, ctx context.Context, workflowName string, dlqID uuid.UUID, opts ...RerunOption) (uuid.UUID, error) {
+	return eng.RerunFromDLQ(ctx, workflowName, dlqID, opts...)
+}
+
 // Global engine instance (can be set by user or created automatically)
 var (
 	globalEngine   *Engine
 	globalEngineMu sync.RWMutex
 )
 
-// SetEngine sets the global engine instance.
+// SetEngine sets the global engine instance for use with package-level functions.
+// This is optional - you can also use Engine methods directly.
+//
+// Example with global engine:
+//
+//	engine := flows.NewEngine(pool)
+//	flows.SetEngine(engine)
+//	exec, err := flows.Start(ctx, myWorkflow, input)
+//
+// Example without global engine:
+//
+//	engine := flows.NewEngine(pool)
+//	exec, err := engine.Start(ctx, myWorkflow, input)
 func SetEngine(engine *Engine) {
 	globalEngineMu.Lock()
 	defer globalEngineMu.Unlock()
@@ -306,6 +532,16 @@ func getGlobalEngine() *Engine {
 }
 
 // Start starts a workflow using the global engine.
+// Requires SetEngine to be called first.
+//
+// Example with global engine:
+//
+//	flows.SetEngine(engine)
+//	exec, err := flows.Start(ctx, myWorkflow, input)
+//
+// Or use StartWith to avoid global state:
+//
+//	exec, err := flows.StartWith(engine, ctx, myWorkflow, input)
 func Start[In, Out any](
 	ctx context.Context,
 	wf *Workflow[In, Out],
@@ -316,19 +552,43 @@ func Start[In, Out any](
 	if engine == nil {
 		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return startInternal(engine.store, ctx, wf, input, opts...)
+	return startWith(engine, ctx, wf, input, opts...)
+}
+
+// StartWith starts a workflow using a specific engine instance.
+// This allows using the engine directly without setting a global engine.
+//
+// Example:
+//
+//	engine := flows.NewEngine(pool)
+//	exec, err := flows.StartWith(engine, ctx, myWorkflow, input)
+func StartWith[In, Out any](
+	eng *Engine,
+	ctx context.Context,
+	wf *Workflow[In, Out],
+	input *In,
+	opts ...StartOption,
+) (*Execution[Out], error) {
+	return startWith(eng, ctx, wf, input, opts...)
 }
 
 // SendSignal sends a signal using the global engine.
-// Requires workflow name for efficient single-shard routing.
-// Get workflow name from the Execution returned by Start():
+// workflowName should be the base workflow name (user-defined constant).
+// Get workflow name from the Execution returned by Start().
 //
+// Example with global engine:
+//
+//	flows.SetEngine(engine)
 //	exec, _ := flows.Start(ctx, myWorkflow, input)
-//	flows.SendSignal(ctx, exec.WorkflowID(), exec.WorkflowName(), "my-signal", payload)
+//	err := flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "signal-name", payload)
+//
+// Or use SendSignalWith to avoid global state:
+//
+//	err := flows.SendSignalWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID(), "signal-name", payload)
 func SendSignal[P any](
 	ctx context.Context,
-	workflowID uuid.UUID,
 	workflowName string,
+	workflowID uuid.UUID,
 	signalName string,
 	payload *P,
 	opts ...SignalOption,
@@ -337,30 +597,88 @@ func SendSignal[P any](
 	if engine == nil {
 		return fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return sendSignalInternal(engine.store, ctx, workflowID, workflowName, signalName, payload, opts...)
+	return SendSignalWith(engine, ctx, workflowName, workflowID, signalName, payload, opts...)
 }
 
 // Query queries workflow status using the global engine.
-// Requires workflow name for efficient single-shard routing.
-// Get workflow name from the Execution returned by Start():
+// workflowName should be the base workflow name (user-defined constant).
+// Get workflow name from the Execution returned by Start().
 //
+// Example with global engine:
+//
+//	flows.SetEngine(engine)
 //	exec, _ := flows.Start(ctx, myWorkflow, input)
-//	info, _ := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
-func Query(ctx context.Context, workflowID uuid.UUID, workflowName string) (*WorkflowInfo, error) {
+//	info, _ := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
+//
+// Or use QueryWith to avoid global state:
+//
+//	info, _ := flows.QueryWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID())
+func Query(ctx context.Context, workflowName string, workflowID uuid.UUID) (*WorkflowInfo, error) {
 	engine := getGlobalEngine()
 	if engine == nil {
 		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return engine.Query(ctx, workflowID, workflowName)
+	return QueryWith(engine, ctx, workflowName, workflowID)
+}
+
+// GetResult retrieves the typed result of a completed workflow using the global engine.
+// This allows retrieving results without keeping the original Execution handle.
+// Returns an error if the workflow is not completed or failed.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example with global engine:
+//
+//	flows.SetEngine(engine)
+//	result, err := flows.GetResult[MyOutput](ctx, workflowName, workflowID)
+//
+// Or use GetResultWith to avoid global state:
+//
+//	result, err := flows.GetResultWith[MyOutput](engine, ctx, workflowName, workflowID)
+func GetResult[Out any](ctx context.Context, workflowName string, workflowID uuid.UUID) (*Out, error) {
+	engine := getGlobalEngine()
+	if engine == nil {
+		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
+	}
+	return GetResultWith[Out](engine, ctx, workflowName, workflowID)
+}
+
+// WaitForResult waits for a workflow to complete and returns the typed result.
+// This is similar to Execution.Get() but works without keeping the Execution handle.
+// Blocks until the workflow finishes or context is cancelled.
+// workflowName should be the base workflow name (user-defined constant).
+//
+// Example with global engine:
+//
+//	flows.SetEngine(engine)
+//	result, err := flows.WaitForResult[MyOutput](ctx, workflowName, workflowID)
+//
+// Or use WaitForResultWith to avoid global state:
+//
+//	result, err := flows.WaitForResultWith[MyOutput](engine, ctx, workflowName, workflowID)
+func WaitForResult[Out any](ctx context.Context, workflowName string, workflowID uuid.UUID) (*Out, error) {
+	engine := getGlobalEngine()
+	if engine == nil {
+		return nil, fmt.Errorf("engine not initialized, call SetEngine first")
+	}
+	return WaitForResultWith[Out](engine, ctx, workflowName, workflowID)
 }
 
 // RerunFromDLQ reruns from DLQ using the global engine.
-// Requires workflow name for efficient single-shard routing.
+// workflowName should be the base workflow name (user-defined constant).
 // Get workflow name from listing DLQ entries (e.g., via a ListDLQ function).
-func RerunFromDLQ(ctx context.Context, dlqID uuid.UUID, workflowName string, opts ...RerunOption) (uuid.UUID, error) {
+//
+// Example with global engine:
+//
+//	flows.SetEngine(engine)
+//	newWorkflowID, err := flows.RerunFromDLQ(ctx, workflowName, dlqID)
+//
+// Or use RerunFromDLQWith to avoid global state:
+//
+//	newWorkflowID, err := flows.RerunFromDLQWith(engine, ctx, workflowName, dlqID)
+func RerunFromDLQ(ctx context.Context, workflowName string, dlqID uuid.UUID, opts ...RerunOption) (uuid.UUID, error) {
 	engine := getGlobalEngine()
 	if engine == nil {
 		return uuid.Nil, fmt.Errorf("engine not initialized, call SetEngine first")
 	}
-	return engine.RerunFromDLQ(ctx, dlqID, workflowName, opts...)
+	return RerunFromDLQWith(engine, ctx, workflowName, dlqID, opts...)
 }

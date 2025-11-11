@@ -19,11 +19,11 @@ docker-clean: ## Remove Docker volumes
 
 test: docker-up ## Run all tests
 	@export DATABASE_URL="postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable" && \
-	go test -v -race ./...
+	go test -v -race -parallel 4 ./...
 
 test-coverage: docker-up ## Run tests with coverage
 	@export DATABASE_URL="postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable" && \
-	go test -v -race -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./... && \
+	go test -v -race -parallel 4 -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./... && \
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated: coverage.html"
 
@@ -40,7 +40,7 @@ deps: ## Download dependencies
 
 # CI targets
 ci-test: ## Run tests in CI environment
-	go test -v -race -coverpkg=./... -coverprofile=coverage.txt -covermode=atomic ./...
+	go test -v -race -parallel 4 -coverpkg=./... -coverprofile=coverage.txt -covermode=atomic ./...
 
 ci-lint: ## Run linter in CI
 	golangci-lint run --timeout=5m

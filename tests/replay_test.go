@@ -519,7 +519,7 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 	t.Log("Activity counter reset to 0 to show replay doesn't re-execute")
 
 	// Query the workflow status to show it's completed
-	status, err := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
+	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err)
 	t.Logf("Workflow status: %+v", status)
 

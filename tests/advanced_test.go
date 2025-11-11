@@ -138,7 +138,7 @@ func TestAdvancedScenarios(t *testing.T) {
 		_, err = exec.Get(ctx)
 		require.Error(t, err)
 
-		status, err := flows.Query(ctx, exec.WorkflowID(), exec.WorkflowName())
+		status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
 		require.NoError(t, err)
 		require.Equal(t, flows.StatusFailed, status.Status)
 	})

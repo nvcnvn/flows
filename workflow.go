@@ -619,10 +619,11 @@ func (c *Context[T]) SetSignalResult(signalName string, payload interface{}) {
 
 // Execution represents a handle to a running workflow execution.
 type Execution[Out any] struct {
-	id           uuid.UUID
-	workflowID   uuid.UUID
-	workflowName string
-	store        *storage.Store
+	id                  uuid.UUID
+	workflowID          uuid.UUID
+	workflowName        string // Base workflow name (user-defined, e.g. "loan-application")
+	workflowNameSharded string // Sharded name (internal, e.g. "loan-application-shard-1")
+	store               *storage.Store
 }
 
 // ID returns the execution ID.
@@ -635,10 +636,18 @@ func (e *Execution[Out]) WorkflowID() uuid.UUID {
 	return e.workflowID
 }
 
-// WorkflowName returns the sharded workflow name.
-// Use this with SendSignal and Query for efficient single-shard queries.
+// WorkflowName returns the base workflow name (user-defined constant).
+// This is the name you use with SendSignal, Query, and other API calls.
+// Example: "loan-application"
 func (e *Execution[Out]) WorkflowName() string {
 	return e.workflowName
+}
+
+// WorkflowNameSharded returns the actual sharded workflow name used internally.
+// Useful for debugging and observability.
+// Example: "loan-application-shard-1"
+func (e *Execution[Out]) WorkflowNameSharded() string {
+	return e.workflowNameSharded
 }
 
 // Get waits for the workflow to complete and returns the result.
@@ -655,8 +664,8 @@ func (e *Execution[Out]) Get(ctx context.Context) (*Out, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ticker.C:
-			// Check workflow status
-			wf, err := e.store.GetWorkflow(ctx, e.workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(e.workflowID))
+			// Check workflow status (use sharded name for database query)
+			wf, err := e.store.GetWorkflow(ctx, e.workflowNameSharded, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(e.workflowID))
 			if err != nil {
 				return nil, err
 			}

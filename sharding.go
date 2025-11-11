@@ -9,37 +9,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// ShardConfig defines the sharding configuration for workflow names.
-type ShardConfig struct {
-	NumShards int // Number of shards (default: 3)
-}
-
-// DefaultShardConfig returns the default sharding configuration with 3 shards.
-func DefaultShardConfig() *ShardConfig {
-	return &ShardConfig{
-		NumShards: 3,
-	}
-}
-
-var (
-	globalShardConfig     = DefaultShardConfig()
-	globalShardConfigLock sync.RWMutex
-)
-
-// SetShardConfig sets the global shard configuration.
-// Must be called before any workflows are started.
-func SetShardConfig(config *ShardConfig) {
-	globalShardConfigLock.Lock()
-	defer globalShardConfigLock.Unlock()
-	globalShardConfig = config
-}
-
-// GetShardConfig returns the current global shard configuration.
-func GetShardConfig() *ShardConfig {
-	globalShardConfigLock.RLock()
-	defer globalShardConfigLock.RUnlock()
-	return globalShardConfig
-}
+// DefaultNumShards is the default number of shards for workflow distribution.
+const DefaultNumShards = 3
 
 // ConsistentHash implements consistent hashing for distributed workflow placement.
 // Uses virtual nodes (replicas) to ensure balanced distribution when adding/removing shards.
@@ -103,53 +74,113 @@ func (h *ConsistentHash) hash(key string) int {
 	return int(hasher.Sum32())
 }
 
-// Global consistent hash ring (100 replicas for good distribution)
+// NumShards returns the number of shards in this hash ring.
+func (h *ConsistentHash) NumShards() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	// Count unique shards
+	shards := make(map[int]bool)
+	for _, shard := range h.hashMap {
+		shards[shard] = true
+	}
+	return len(shards)
+}
+
+// NewDefaultHashRing creates a hash ring with the default configuration (3 shards, 100 replicas).
+func NewDefaultHashRing() *ConsistentHash {
+	h := NewConsistentHash(100) // 100 virtual nodes per shard
+	for i := 0; i < DefaultNumShards; i++ {
+		h.Add(i)
+	}
+	return h
+}
+
+// Global consistent hash ring
 var (
-	globalHashRing     *ConsistentHash
-	globalHashRingOnce sync.Once
+	globalHashRing   *ConsistentHash
+	globalHashRingMu sync.RWMutex
 )
 
-// initHashRing initializes the global hash ring with the configured number of shards.
-func initHashRing() {
-	globalHashRingOnce.Do(func() {
-		config := GetShardConfig()
-		globalHashRing = NewConsistentHash(100) // 100 virtual nodes per shard
-		for i := 0; i < config.NumShards; i++ {
-			globalHashRing.Add(i)
+// SetHashRing sets the global hash ring instance for use with package-level functions.
+// This is optional - you can also pass custom hash rings to Engine/Worker.
+//
+// Example with global hash ring:
+//
+//	hashRing := flows.NewDefaultHashRing()
+//	flows.SetHashRing(hashRing)
+//	exec, err := flows.Start(ctx, myWorkflow, input)
+//
+// Example with custom shards:
+//
+//	hashRing := flows.NewConsistentHash(100)
+//	for i := 0; i < 5; i++ {
+//		hashRing.Add(i)
+//	}
+//	flows.SetHashRing(hashRing)
+func SetHashRing(hashRing *ConsistentHash) {
+	globalHashRingMu.Lock()
+	defer globalHashRingMu.Unlock()
+	globalHashRing = hashRing
+}
+
+// getGlobalHashRing safely retrieves the global hash ring instance.
+// If not set, returns a default hash ring with 3 shards.
+func getGlobalHashRing() *ConsistentHash {
+	globalHashRingMu.RLock()
+	defer globalHashRingMu.RUnlock()
+
+	if globalHashRing == nil {
+		// Return default hash ring if not set
+		globalHashRingMu.RUnlock()
+		globalHashRingMu.Lock()
+		if globalHashRing == nil {
+			globalHashRing = NewDefaultHashRing()
 		}
-	})
+		globalHashRingMu.Unlock()
+		globalHashRingMu.RLock()
+	}
+
+	return globalHashRing
 }
 
-// GetShardForWorkflow returns the shard number for a given workflow ID using consistent hashing.
-// This provides stable shard assignment that only changes for ~1/N workflows when adding a new shard.
-func GetShardForWorkflow(workflowID uuid.UUID) int {
-	initHashRing()
-	return globalHashRing.Get(workflowID.String())
+// getShardForWorkflow returns the shard number for a given workflow ID using consistent hashing.
+// If hashRing is nil, uses the global hash ring.
+func getShardForWorkflow(workflowID uuid.UUID, hashRing *ConsistentHash) int {
+	if hashRing == nil {
+		hashRing = getGlobalHashRing()
+	}
+	return hashRing.Get(workflowID.String())
 }
 
-// GetShardedWorkflowName returns the workflow name with shard suffix.
+// getShardedWorkflowName returns the workflow name with shard suffix.
 // Format: "{baseName}-shard-{shardNum}"
 // Example: "loan-application-workflow" -> "loan-application-workflow-shard-0"
-func GetShardedWorkflowName(baseName string, workflowID uuid.UUID) string {
-	shard := GetShardForWorkflow(workflowID)
+// If hashRing is nil, uses the global hash ring.
+func getShardedWorkflowName(baseName string, workflowID uuid.UUID, hashRing *ConsistentHash) string {
+	shard := getShardForWorkflow(workflowID, hashRing)
 	return fmt.Sprintf("%s-shard-%d", baseName, shard)
 }
 
-// GetAllShardedWorkflowNames returns all possible sharded names for a workflow type.
+// getAllShardedWorkflowNames returns all possible sharded names for a workflow type.
 // Workers should poll all shards for their workflow type.
 // Example: "loan-application-workflow" -> ["...-shard-0", "...-shard-1", "...-shard-2"]
-func GetAllShardedWorkflowNames(baseName string) []string {
-	config := GetShardConfig()
-	names := make([]string, config.NumShards)
-	for i := 0; i < config.NumShards; i++ {
+// If hashRing is nil, uses the global hash ring.
+func getAllShardedWorkflowNames(baseName string, hashRing *ConsistentHash) []string {
+	if hashRing == nil {
+		hashRing = getGlobalHashRing()
+	}
+	numShards := hashRing.NumShards()
+	names := make([]string, numShards)
+	for i := 0; i < numShards; i++ {
 		names[i] = fmt.Sprintf("%s-shard-%d", baseName, i)
 	}
 	return names
 }
 
-// ExtractBaseWorkflowName extracts the base workflow name from a sharded name.
+// extractBaseWorkflowName extracts the base workflow name from a sharded name.
 // Example: "loan-application-workflow-shard-0" -> "loan-application-workflow"
-func ExtractBaseWorkflowName(shardedName string) string {
+func extractBaseWorkflowName(shardedName string) string {
 	// Simple approach: find last "-shard-" and strip it
 	const suffix = "-shard-"
 	for i := len(shardedName) - 1; i >= 0; i-- {
