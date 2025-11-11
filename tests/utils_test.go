@@ -1,10 +1,11 @@
-package testutil
+package examples_test
 
 import (
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,40 +13,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// SetupTestDB creates a test database connection and applies migrations
+var (
+	sharedPool     *pgxpool.Pool
+	sharedPoolOnce sync.Once
+	sharedPoolMu   sync.Mutex
+)
+
+// SetupTestDB returns a shared database connection pool for all tests
+// This simulates production where multiple processes share the same database
 func SetupTestDB(t *testing.T) *pgxpool.Pool {
-	ctx := context.Background()
+	sharedPoolMu.Lock()
+	defer sharedPoolMu.Unlock()
 
-	// Get connection string from environment
-	connString := os.Getenv("DATABASE_URL")
-	if connString == "" {
-		connString = "postgres://postgres:postgres@localhost:5432/flows_test?sslmode=disable"
-	}
+	sharedPoolOnce.Do(func() {
+		ctx := context.Background()
 
-	// Connect to database
-	pool, err := pgxpool.New(ctx, connString)
-	require.NoError(t, err, "Failed to connect to database")
-
-	// Verify connection with retries (for CI environments)
-	maxRetries := 10
-	for i := 0; i < maxRetries; i++ {
-		err = pool.Ping(ctx)
-		if err == nil {
-			break
+		// Get connection string from environment
+		connString := os.Getenv("DATABASE_URL")
+		if connString == "" {
+			connString = "postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable"
 		}
-		if i == maxRetries-1 {
-			require.NoError(t, err, "Failed to ping database after retries")
-		}
-		t.Logf("Waiting for database... (attempt %d/%d)", i+1, maxRetries)
-		time.Sleep(2 * time.Second)
-	}
 
-	// Cleanup function
-	t.Cleanup(func() {
-		pool.Close()
+		// Connect to database
+		pool, err := pgxpool.New(ctx, connString)
+		if err != nil {
+			panic("Failed to connect to database: " + err.Error())
+		}
+
+		// Verify connection with retries (for CI environments)
+		maxRetries := 10
+		for i := 0; i < maxRetries; i++ {
+			err = pool.Ping(ctx)
+			if err == nil {
+				break
+			}
+			if i == maxRetries-1 {
+				panic("Failed to ping database after retries: " + err.Error())
+			}
+			time.Sleep(2 * time.Second)
+		}
+
+		sharedPool = pool
 	})
 
-	return pool
+	return sharedPool
 }
 
 // EnsureDocker checks if Docker is available

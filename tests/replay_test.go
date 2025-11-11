@@ -3,13 +3,13 @@ package examples_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nvcnvn/flows"
-	"github.com/nvcnvn/flows/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,14 +47,49 @@ type ProcessJobOutput struct {
 	Attempt     int    `json:"attempt"`
 }
 
-// Global counter to simulate activity failure on first attempt
-var processJobAttemptCounter int32
+// Per-job counter to simulate activity failure on first attempt
+// This allows parallel tests to run without interfering with each other
+var (
+	jobAttemptCounters   = make(map[string]*int32)
+	jobAttemptCountersMu sync.Mutex
+)
+
+func getJobAttemptCounter(jobID string) *int32 {
+	jobAttemptCountersMu.Lock()
+	defer jobAttemptCountersMu.Unlock()
+
+	if counter, exists := jobAttemptCounters[jobID]; exists {
+		return counter
+	}
+
+	var counter int32
+	jobAttemptCounters[jobID] = &counter
+	return &counter
+}
+
+func resetJobAttemptCounter(jobID string) {
+	jobAttemptCountersMu.Lock()
+	defer jobAttemptCountersMu.Unlock()
+
+	delete(jobAttemptCounters, jobID)
+}
+
+func getJobAttemptCount(jobID string) int32 {
+	jobAttemptCountersMu.Lock()
+	defer jobAttemptCountersMu.Unlock()
+
+	if counter, exists := jobAttemptCounters[jobID]; exists {
+		return atomic.LoadInt32(counter)
+	}
+	return 0
+}
 
 // ProcessJobActivity - fails on first attempt, succeeds on retry
 var ProcessJobActivity = flows.NewActivity(
 	"process-job-with-retry",
 	func(ctx context.Context, input *ProcessJobInput) (*ProcessJobOutput, error) {
-		attempt := atomic.AddInt32(&processJobAttemptCounter, 1)
+		counter := getJobAttemptCounter(input.JobID)
+		attempt := atomic.AddInt32(counter, 1)
 
 		fmt.Printf("ProcessJobActivity called: job=%s, attempt=%d (input.attempt=%d)\n",
 			input.JobID, attempt, input.Attempt)
@@ -178,13 +213,17 @@ var ReplayTestWorkflow = flows.New(
 )
 
 func TestReplayWorkflow_ActivityRetry(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
-	// Reset global counter
-	atomic.StoreInt32(&processJobAttemptCounter, 0)
+	jobID := "job-replay-test-001"
+
+	// Reset counter for this specific job
+	resetJobAttemptCounter(jobID)
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -198,7 +237,7 @@ func TestReplayWorkflow_ActivityRetry(t *testing.T) {
 
 	// Start workflow
 	exec, err := flows.Start(ctx, ReplayTestWorkflow, &ReplayWorkflowInput{
-		JobID:   "job-replay-test-001",
+		JobID:   jobID,
 		Retries: 3,
 	})
 	require.NoError(t, err, "Failed to start workflow")
@@ -250,7 +289,7 @@ func TestReplayWorkflow_ActivityRetry(t *testing.T) {
 		assert.Equal(t, "completed", res.result.Status, "Status should be completed")
 
 		// Verify activity was actually called (failed first, succeeded on retry)
-		currentAttempts := atomic.LoadInt32(&processJobAttemptCounter)
+		currentAttempts := getJobAttemptCount(jobID)
 		assert.Equal(t, int32(2), currentAttempts,
 			"Activity should have been called twice (1 failure + 1 success)")
 
@@ -308,11 +347,15 @@ func TestReplayWorkflow_ActivityRetry(t *testing.T) {
 }
 
 func TestReplayWorkflow_ResumeAfterWorkerRestart(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
-	atomic.StoreInt32(&processJobAttemptCounter, 0)
+	jobID := "job-worker-restart"
 
-	pool := testutil.SetupTestDB(t)
+	resetJobAttemptCounter(jobID)
+
+	pool := SetupTestDB(t)
 
 	engine := flows.NewEngine(pool)
 	flows.SetEngine(engine)
@@ -321,7 +364,7 @@ func TestReplayWorkflow_ResumeAfterWorkerRestart(t *testing.T) {
 	ctx = flows.WithTenantID(ctx, tenantID)
 
 	exec, err := flows.Start(ctx, ReplayTestWorkflow, &ReplayWorkflowInput{
-		JobID:   "job-worker-restart",
+		JobID:   jobID,
 		Retries: 3,
 	})
 	require.NoError(t, err)
@@ -342,7 +385,7 @@ func TestReplayWorkflow_ResumeAfterWorkerRestart(t *testing.T) {
 	}()
 
 	require.Eventually(t, func() bool {
-		return atomic.LoadInt32(&processJobAttemptCounter) >= 1
+		return getJobAttemptCount(jobID) >= 1
 	}, 15*time.Second, 200*time.Millisecond, "activity should be attempted at least once")
 
 	// Allow the first failure to be fully recorded before stopping the worker
@@ -389,7 +432,7 @@ func TestReplayWorkflow_ResumeAfterWorkerRestart(t *testing.T) {
 		t.Fatal("workflow did not resume after worker restart")
 	}
 
-	attempts := atomic.LoadInt32(&processJobAttemptCounter)
+	attempts := getJobAttemptCount(jobID)
 	assert.Equal(t, int32(2), attempts, "activity should complete after retry by second worker")
 }
 
@@ -404,10 +447,12 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Reset counter
-	atomic.StoreInt32(&processJobAttemptCounter, 0)
+	jobID := "job-manual-replay-test"
 
-	pool := testutil.SetupTestDB(t)
+	// Reset counter
+	resetJobAttemptCounter(jobID)
+
+	pool := SetupTestDB(t)
 	engine := flows.NewEngine(pool)
 	flows.SetEngine(engine)
 
@@ -417,7 +462,7 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 	// First execution
 	t.Log("=== FIRST EXECUTION ===")
 	exec, err := flows.Start(ctx, ReplayTestWorkflow, &ReplayWorkflowInput{
-		JobID:   "job-manual-replay-test",
+		JobID:   jobID,
 		Retries: 3,
 	})
 	require.NoError(t, err)
@@ -441,11 +486,11 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 	t.Logf("First execution completed:")
 	t.Logf("  Execution ID: %s", result1.ExecutionID)
 	t.Logf("  Initial Time: %v", result1.InitialTime)
-	t.Logf("  Activity attempts: %d", atomic.LoadInt32(&processJobAttemptCounter))
+	t.Logf("  Activity attempts: %d", getJobAttemptCount(jobID))
 
-	// Reset counter to simulate replay environment
-	firstAttempts := atomic.LoadInt32(&processJobAttemptCounter)
-	atomic.StoreInt32(&processJobAttemptCounter, 0)
+	// Save counter to simulate replay environment
+	firstAttempts := getJobAttemptCount(jobID)
+	resetJobAttemptCounter(jobID)
 
 	// Simulate replay by processing the same workflow again
 	// In real scenario, this would happen after worker restart
@@ -459,7 +504,7 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 	t.Logf("Workflow status: %+v", status)
 
 	// On replay, the activity should not be called again
-	replayAttempts := atomic.LoadInt32(&processJobAttemptCounter)
+	replayAttempts := getJobAttemptCount(jobID)
 	t.Logf("\nActivity call count:")
 	t.Logf("  First execution: %d calls (1 fail + 1 success)", firstAttempts)
 	t.Logf("  After 'replay': %d calls (activity result cached)", replayAttempts)
@@ -469,6 +514,8 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 }
 
 func TestReplayWorkflow_MultipleFailures(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Create a counter that fails twice before succeeding
@@ -540,7 +587,7 @@ func TestReplayWorkflow_MultipleFailures(t *testing.T) {
 	// Reset counter
 	atomic.StoreInt32(&multiFailCounter, 0)
 
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 	engine := flows.NewEngine(pool)
 	flows.SetEngine(engine)
 

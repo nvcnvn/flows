@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nvcnvn/flows"
-	"github.com/nvcnvn/flows/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -174,10 +173,12 @@ var TimeTrackingWorkflow = flows.New(
 )
 
 func TestTimeTrackingWorkflow_Complete(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -307,10 +308,12 @@ func TestTimeTrackingWorkflow_Complete(t *testing.T) {
 }
 
 func TestTimeTrackingWorkflow_Rejection(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -386,10 +389,12 @@ func TestTimeTrackingWorkflow_Rejection(t *testing.T) {
 }
 
 func TestTimeTrackingWorkflow_Determinism(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)

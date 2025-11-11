@@ -3,19 +3,20 @@ package examples_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nvcnvn/flows"
-	"github.com/nvcnvn/flows/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type RetryInput struct {
-	AttemptToSucceed int `json:"attempt_to_succeed"`
+	TestID           string `json:"test_id"` // Unique identifier for this test execution
+	AttemptToSucceed int    `json:"attempt_to_succeed"`
 }
 
 type RetryOutput struct {
@@ -23,14 +24,39 @@ type RetryOutput struct {
 	Attempts int  `json:"attempts"`
 }
 
-// Counter for tracking retry attempts
-var attemptCounter int32
+// Per-test counter for tracking retry attempts
+// This allows parallel tests to run without interfering with each other
+var (
+	retryAttemptCounters   = make(map[string]*int32)
+	retryAttemptCountersMu sync.Mutex
+)
+
+func getRetryAttemptCounter(testID string) *int32 {
+	retryAttemptCountersMu.Lock()
+	defer retryAttemptCountersMu.Unlock()
+
+	if counter, exists := retryAttemptCounters[testID]; exists {
+		return counter
+	}
+
+	var counter int32
+	retryAttemptCounters[testID] = &counter
+	return &counter
+}
+
+func resetRetryAttemptCounter(testID string) {
+	retryAttemptCountersMu.Lock()
+	defer retryAttemptCountersMu.Unlock()
+
+	delete(retryAttemptCounters, testID)
+}
 
 // RetryableActivity fails until a certain attempt
 var RetryableActivity = flows.NewActivity(
 	"retryable-activity",
 	func(ctx context.Context, input *RetryInput) (*RetryOutput, error) {
-		attempt := atomic.AddInt32(&attemptCounter, 1)
+		counter := getRetryAttemptCounter(input.TestID)
+		attempt := atomic.AddInt32(counter, 1)
 
 		if int(attempt) < input.AttemptToSucceed {
 			return nil, errors.New("transient error - will retry")
@@ -62,10 +88,12 @@ var RetryWorkflow = flows.New(
 )
 
 func TestActivityRetry_Success(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -75,11 +103,15 @@ func TestActivityRetry_Success(t *testing.T) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Reset counter
-	atomic.StoreInt32(&attemptCounter, 0)
+	// Create unique test ID
+	testID := uuid.New().String()
+
+	// Reset counter for this test
+	resetRetryAttemptCounter(testID)
 
 	// Start workflow that should succeed on 3rd attempt
 	exec, err := flows.Start(ctx, RetryWorkflow, &RetryInput{
+		TestID:           testID,
 		AttemptToSucceed: 3,
 	})
 	require.NoError(t, err)
@@ -129,10 +161,12 @@ func TestActivityRetry_Success(t *testing.T) {
 }
 
 func TestActivityRetry_MaxAttemptsExceeded(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -142,11 +176,15 @@ func TestActivityRetry_MaxAttemptsExceeded(t *testing.T) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Reset counter
-	atomic.StoreInt32(&attemptCounter, 0)
+	// Create unique test ID
+	testID := uuid.New().String()
+
+	// Reset counter for this test
+	resetRetryAttemptCounter(testID)
 
 	// Start workflow that requires 10 attempts (more than max of 5)
 	exec, err := flows.Start(ctx, RetryWorkflow, &RetryInput{
+		TestID:           testID,
 		AttemptToSucceed: 10,
 	})
 	require.NoError(t, err)
@@ -215,10 +253,12 @@ var TerminalErrorWorkflow = flows.New(
 )
 
 func TestActivityRetry_TerminalError(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)

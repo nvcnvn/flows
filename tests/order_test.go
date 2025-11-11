@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nvcnvn/flows"
-	"github.com/nvcnvn/flows/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -141,10 +140,12 @@ var OrderWorkflow = flows.New(
 )
 
 func TestOrderWorkflow_Complete(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -229,10 +230,12 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 }
 
 func TestOrderWorkflow_WithTransaction(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -313,10 +316,12 @@ func TestOrderWorkflow_WithTransaction(t *testing.T) {
 }
 
 func TestOrderWorkflow_SignalTimeout(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Setup database connection
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	// Create engine
 	engine := flows.NewEngine(pool)
@@ -365,9 +370,11 @@ func TestOrderWorkflow_SignalTimeout(t *testing.T) {
 }
 
 func TestOrderWorkflow_SignalBeforeWorker(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
-	pool := testutil.SetupTestDB(t)
+	pool := SetupTestDB(t)
 
 	engine := flows.NewEngine(pool)
 	flows.SetEngine(engine)

@@ -161,3 +161,16 @@ type ActivityInfo struct {
 	Status      ActivityStatus
 	Attempt     int
 }
+
+// NoInput is a placeholder for workflows or activities that don't take input.
+type NoInput struct{}
+
+// NoOutput is a placeholder for workflows or activities that don't return output.
+type NoOutput struct{}
+
+// WorkflowStatusInfo represents the status of a workflow execution.
+type WorkflowStatusInfo struct {
+	WorkflowID string
+	Status     string
+	Error      string
+}

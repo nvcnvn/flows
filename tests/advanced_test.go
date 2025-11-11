@@ -1,0 +1,145 @@
+package examples_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+
+	"github.com/nvcnvn/flows"
+)
+
+var failCount = atomic.NewInt32(0)
+
+var AdvancedTestFailThenSucceedActivity = flows.NewActivity(
+	"advanced-fail-then-succeed",
+	func(ctx context.Context, input *flows.NoInput) (*flows.NoOutput, error) {
+		fmt.Println("executing advanced-fail-then-succeed activity")
+		failCount.Add(1)
+		if failCount.Load() <= 2 {
+			return nil, flows.NewRetryableError(fmt.Errorf("transient failure"))
+		}
+		return &flows.NoOutput{}, nil
+	},
+	flows.RetryPolicy{
+		MaxAttempts:     3,
+		InitialInterval: 100 * time.Millisecond,
+		MaxInterval:     1 * time.Second,
+		BackoffFactor:   2.0,
+	},
+)
+
+var AdvancedTestRetryWorkflow = flows.New(
+	"advanced-retry-workflow",
+	1,
+	func(ctx *flows.Context[flows.NoInput]) (*flows.NoOutput, error) {
+		_, err := flows.ExecuteActivity(ctx, AdvancedTestFailThenSucceedActivity, &flows.NoInput{})
+		if err != nil {
+			return nil, err
+		}
+		return &flows.NoOutput{}, nil
+	},
+)
+
+var AdvancedTestLogActivity = flows.NewActivity(
+	"advanced-log-activity",
+	func(ctx context.Context, input *string) (*flows.NoOutput, error) {
+		fmt.Println(*input)
+		return &flows.NoOutput{}, nil
+	},
+	flows.RetryPolicy{MaxAttempts: 1},
+)
+
+var AdvancedTestLoopWorkflow = flows.New(
+	"advanced-loop-workflow",
+	1,
+	func(ctx *flows.Context[int]) (*int, error) {
+		loopCount := ctx.Input()
+		for i := 0; i < *loopCount; i++ {
+			msg := fmt.Sprintf("Executing loop %d", i)
+			_, err := flows.ExecuteActivity(ctx, AdvancedTestLogActivity, &msg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return loopCount, nil
+	},
+)
+
+var FailingActivity = flows.NewActivity(
+	"failing-activity",
+	func(ctx context.Context, input *flows.NoInput) (*flows.NoOutput, error) {
+		return nil, flows.NewTerminalError(fmt.Errorf("i am a failure"))
+	},
+	flows.RetryPolicy{MaxAttempts: 1},
+)
+
+var FailingWorkflow = flows.New(
+	"failing-workflow",
+	1,
+	func(ctx *flows.Context[flows.NoInput]) (*flows.NoOutput, error) {
+		_, err := flows.ExecuteActivity(ctx, FailingActivity, &flows.NoInput{})
+		return nil, err
+	},
+)
+
+func TestAdvancedScenarios(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := SetupTestDB(t)
+	engine := flows.NewEngine(db)
+	flows.SetEngine(engine)
+
+	tenantID := uuid.New()
+	ctx = flows.WithTenantID(ctx, tenantID)
+
+	worker := flows.NewWorker(db, flows.WorkerConfig{
+		TenantID: tenantID,
+		WorkflowNames: []string{
+			"advanced-retry-workflow",
+			"advanced-loop-workflow",
+			"failing-workflow",
+		},
+	})
+
+	go func() {
+		err := worker.Run(ctx)
+		require.NoError(t, err)
+	}()
+	defer worker.Stop()
+
+	t.Run("TestActivityRetry", func(t *testing.T) {
+		failCount.Store(0)
+		exec, err := flows.Start(ctx, AdvancedTestRetryWorkflow, &flows.NoInput{})
+		require.NoError(t, err)
+		_, err = exec.Get(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int32(3), failCount.Load())
+	})
+
+	t.Run("TestLoopWorkflow", func(t *testing.T) {
+		loopCount := 5
+		exec, err := flows.Start(ctx, AdvancedTestLoopWorkflow, &loopCount)
+		require.NoError(t, err)
+		result, err := exec.Get(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 5, *result)
+	})
+
+	t.Run("TestWorkflowFail", func(t *testing.T) {
+		exec, err := flows.Start(ctx, FailingWorkflow, &flows.NoInput{})
+		require.NoError(t, err)
+
+		_, err = exec.Get(ctx)
+		require.Error(t, err)
+
+		status, err := flows.Query(ctx, exec.WorkflowID())
+		require.NoError(t, err)
+		require.Equal(t, flows.StatusFailed, status.Status)
+	})
+}
