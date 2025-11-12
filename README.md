@@ -23,6 +23,9 @@
 ```bash
 go get github.com/nvcnvn/flows
 ```
+Apply our schema in [[migrations](migrations)]
+- [migrations/001_init.sql](migrations/001_init.sql): base schema for any postgres
+- [migrations/002_citus.sql](migrations/002_citus.sql): optional - if you're use citus for sharding
 
 ### Define Workflows and Activities
 
@@ -152,10 +155,10 @@ exec, err := flows.StartWith(engine, ctx, OrderWorkflow, &OrderInput{})
 // REST API pattern: Return 201 Created with workflow_name and workflow_id for async processing
 // Synchronous pattern: Block and wait for completion
 result, err = flows.WaitForResultWith[OrderOutput](engine, ctx, exec.WorkflowName(), exec.WorkflowID())
-// See USAGE.md for additional operations: Query, Signal, Cancel
 ```
+See [USAGE.md](USAGE.md) for additional operations: Query, Signal, Cancel
 
-Finally, please check "demo" folder for real world example.
+Finally, please check [demo](demo) folder for real world example.
 
 ### Note about Workflow Name Sharding
 
