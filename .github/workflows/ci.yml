@@ -23,12 +23,12 @@ jobs:
 
     - name: Start PostgreSQL with docker-compose
       run: |
-        docker-compose up -d postgres
-        docker-compose ps
+        docker compose up -d postgres
+        docker compose ps
 
     - name: Wait for PostgreSQL
       run: |
-        until docker-compose exec -T postgres pg_isready -U postgres; do
+        until docker compose exec -T postgres pg_isready -U postgres; do
           echo "Waiting for postgres..."
           sleep 2
         done
