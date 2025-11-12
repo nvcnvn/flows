@@ -11,21 +11,6 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: flows_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5433:5432
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -36,9 +21,14 @@ jobs:
         go-version: '1.25'
         cache: true
 
+    - name: Start PostgreSQL with docker-compose
+      run: |
+        docker-compose up -d postgres
+        docker-compose ps
+
     - name: Wait for PostgreSQL
       run: |
-        until pg_isready -h localhost -p 5433 -U postgres; do
+        until docker-compose exec -T postgres pg_isready -U postgres; do
           echo "Waiting for postgres..."
           sleep 2
         done
@@ -55,6 +45,16 @@ jobs:
         file: ./coverage.txt
         flags: unittests
         name: codecov-umbrella
+
+    - name: Show PostgreSQL logs (if tests failed)
+      if: failure()
+      run: |
+        docker-compose logs postgres
+
+    - name: Stop docker-compose services
+      if: always()
+      run: |
+        docker-compose down -v
 
     - name: Test Summary
       if: always()
