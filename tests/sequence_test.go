@@ -545,13 +545,9 @@ func TestSequenceNumber_LoopOperations(t *testing.T) {
 func TestSequenceNumber_ConditionalBranching(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
 	pool := SetupTestDB(t)
 	engine := flows.NewEngine(pool)
 	flows.SetEngine(engine)
-
-	tenantID := uuid.New()
-	ctx = flows.WithTenantID(ctx, tenantID)
 
 	type BranchInput struct {
 		TakeBranchA bool `json:"take_branch_a"`

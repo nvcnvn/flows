@@ -673,3 +673,191 @@ func TestReplayWorkflow_MultipleFailures(t *testing.T) {
 		t.Fatal("Workflow timeout")
 	}
 }
+
+// TestReplayWorkflow_LoopWithWorkerCrash tests that a workflow with a for loop
+// correctly resumes after worker crashes mid-execution
+func TestReplayWorkflow_LoopWithWorkerCrash(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	pool := SetupTestDB(t)
+	engine := flows.NewEngine(pool)
+	flows.SetEngine(engine)
+
+	tenantID := uuid.New()
+	ctx = flows.WithTenantID(ctx, tenantID)
+
+	testID := uuid.New().String()
+
+	// Counter that tracks how many times the activity was actually executed
+	var executionCounter int32
+
+	// SlowCounterActivity simulates a slow operation
+	SlowCounterActivity := flows.NewActivity(
+		"slow-counter-activity",
+		func(ctx context.Context, input *int) (*int, error) {
+			iteration := *input
+			actualCount := atomic.AddInt32(&executionCounter, 1)
+
+			t.Logf("SlowCounterActivity: iteration=%d, actualExecutionCount=%d", iteration, actualCount)
+
+			// Simulate slow operation
+			time.Sleep(100 * time.Millisecond)
+
+			return input, nil
+		},
+		flows.DefaultRetryPolicy,
+	)
+
+	type LoopInput struct {
+		TestID      string `json:"test_id"`
+		TargetCount int    `json:"target_count"`
+	}
+
+	type LoopOutput struct {
+		TestID         string `json:"test_id"`
+		FinalCount     int    `json:"final_count"`
+		ExecutionCount int    `json:"execution_count"`
+	}
+
+	// Workflow that counts to 10 in a loop
+	LoopWorkflow := flows.New(
+		"loop-with-crash-workflow",
+		1,
+		func(ctx *flows.Context[LoopInput]) (*LoopOutput, error) {
+			input := ctx.Input()
+
+			t.Logf("Workflow executing: testID=%s, target=%d", input.TestID, input.TargetCount)
+
+			// Loop 10 times, executing an activity each time
+			for i := 0; i < input.TargetCount; i++ {
+				t.Logf("Workflow loop iteration: %d", i)
+
+				_, err := flows.ExecuteActivity(ctx, SlowCounterActivity, &i)
+				if err != nil {
+					return nil, fmt.Errorf("activity failed at iteration %d: %w", i, err)
+				}
+			}
+
+			// Get final execution count
+			finalExecCount := int(atomic.LoadInt32(&executionCounter))
+
+			return &LoopOutput{
+				TestID:         input.TestID,
+				FinalCount:     input.TargetCount,
+				ExecutionCount: finalExecCount,
+			}, nil
+		},
+	)
+
+	// Start workflow
+	exec, err := flows.Start(ctx, LoopWorkflow, &LoopInput{
+		TestID:      testID,
+		TargetCount: 10,
+	})
+	require.NoError(t, err)
+	t.Logf("Workflow started: id=%s", exec.WorkflowID())
+
+	// Start first worker - will handle first ~5 iterations then be cancelled
+	// Use short visibility timeout for testing so recovery worker can pick up quickly
+	worker1 := flows.NewWorker(pool, flows.WorkerConfig{
+		Concurrency:       1,
+		WorkflowNames:     []string{"loop-with-crash-workflow"},
+		PollInterval:      100 * time.Millisecond,
+		TenantID:          tenantID,
+		VisibilityTimeout: 2 * time.Second, // Short timeout for testing
+	})
+
+	worker1Ctx, cancelWorker1 := context.WithCancel(ctx)
+	worker1Done := make(chan struct{})
+
+	go func() {
+		defer close(worker1Done)
+		if err := worker1.Run(worker1Ctx); err != nil && err != context.Canceled {
+			t.Logf("Worker1 error (expected): %v", err)
+		}
+	}()
+
+	// Wait for ~5 iterations to complete (each takes ~100ms + processing time)
+	// This simulates the worker processing some iterations before crashing
+	time.Sleep(1500 * time.Millisecond)
+
+	iterationsBeforeCrash := atomic.LoadInt32(&executionCounter)
+	t.Logf("=== SIMULATING WORKER CRASH ===")
+	t.Logf("Iterations completed before crash: %d", iterationsBeforeCrash)
+
+	// Cancel first worker (simulates crash)
+	cancelWorker1()
+	worker1.Stop()
+
+	// Wait for worker to fully stop
+	<-worker1Done
+	t.Logf("Worker1 stopped")
+
+	// Wait for visibility timeout to expire so recovery worker can pick up the task
+	// We set visibility timeout to 2 seconds, so wait a bit longer
+	t.Logf("Waiting for visibility timeout to expire...")
+	time.Sleep(3 * time.Second)
+
+	// Start second worker - will resume from where first worker left off
+	t.Logf("=== STARTING RECOVERY WORKER ===")
+	worker2 := flows.NewWorker(pool, flows.WorkerConfig{
+		Concurrency:       1,
+		WorkflowNames:     []string{"loop-with-crash-workflow"},
+		PollInterval:      100 * time.Millisecond,
+		TenantID:          tenantID,
+		VisibilityTimeout: 2 * time.Second,
+	})
+	defer worker2.Stop()
+
+	worker2Ctx, cancelWorker2 := context.WithCancel(ctx)
+	defer cancelWorker2()
+
+	go func() {
+		if err := worker2.Run(worker2Ctx); err != nil && err != context.Canceled {
+			t.Logf("Worker2 error: %v", err)
+		}
+	}()
+
+	// Wait for workflow to complete
+	result, err := exec.Get(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	iterationsAfterRecovery := atomic.LoadInt32(&executionCounter)
+
+	t.Logf("\n=== WORKFLOW COMPLETED ===")
+	t.Logf("Test ID: %s", result.TestID)
+	t.Logf("Target count: %d", result.FinalCount)
+	t.Logf("Iterations before crash: %d", iterationsBeforeCrash)
+	t.Logf("Total activity executions: %d", iterationsAfterRecovery)
+	t.Logf("Execution count in result: %d", result.ExecutionCount)
+
+	// Verify the workflow completed successfully
+	assert.Equal(t, 10, result.FinalCount, "Should have counted to 10")
+
+	// Verify we had a crash mid-way
+	assert.Greater(t, iterationsBeforeCrash, int32(0),
+		"Should have completed some iterations before crash")
+	assert.Less(t, iterationsBeforeCrash, int32(10),
+		"Should not have completed all iterations before crash")
+
+	// Note: The in-flight activity at crash time may be re-executed, so we expect
+	// at most one extra execution. Activities that completed before crash are replayed
+	// from cache and not re-executed.
+	assert.LessOrEqual(t, iterationsAfterRecovery, int32(11),
+		"Should have at most 11 executions (10 + 1 potential retry of in-flight activity)")
+	assert.GreaterOrEqual(t, iterationsAfterRecovery, int32(10),
+		"Should have at least 10 executions")
+
+	reExecutedCount := iterationsAfterRecovery - 10
+
+	t.Logf("\n✅ Replay worked correctly:")
+	t.Logf("   - Worker crashed after %d iterations", iterationsBeforeCrash)
+	t.Logf("   - Recovery worker resumed from cached state")
+	t.Logf("   - Completed activities (0-%d) were replayed from cache (not re-executed)", iterationsBeforeCrash-1)
+	t.Logf("   - In-flight activities: %d re-executed", reExecutedCount)
+	t.Logf("   - Remaining activities (%d-9) executed normally", iterationsBeforeCrash)
+	t.Logf("   - Total activity executions: %d", iterationsAfterRecovery)
+	t.Logf("   - Workflow completed successfully with correct result: %d", result.FinalCount)
+}
