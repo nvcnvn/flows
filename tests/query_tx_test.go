@@ -71,6 +71,7 @@ func TestQueryWithTransaction(t *testing.T) {
 	// Test 1: Query within a transaction (read-only)
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
+	//nolint:errcheck
 	defer tx.Rollback(ctx)
 
 	// Query workflow within transaction

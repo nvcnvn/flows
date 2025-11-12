@@ -94,6 +94,7 @@ func main() {
 
 	// Health check
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		//nolint:errcheck
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
@@ -142,6 +143,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	//nolint:errcheck
 	json.NewEncoder(w).Encode(data)
 }
 

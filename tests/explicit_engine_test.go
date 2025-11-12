@@ -94,7 +94,11 @@ func TestExplicitEngine_QueryAndGetResult(t *testing.T) {
 		1,
 		func(ctx *flows.Context[ExplicitEngineInput]) (*ExplicitEngineOutput, error) {
 			// Do some work
-			ctx.Sleep(1 * time.Second)
+			err := ctx.Sleep(1 * time.Second)
+			if err != nil {
+				return nil, err
+			}
+
 			return &ExplicitEngineOutput{
 				Message: "Completed: " + ctx.Input().Data,
 			}, nil

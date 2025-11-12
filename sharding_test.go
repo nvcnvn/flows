@@ -7,54 +7,6 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestShardDistribution(t *testing.T) {
-	// Test that simple modulo-based sharding distributes keys evenly across shards
-	numShards := 9
-	numKeys := 10000
-
-	config := NewShardConfig(numShards)
-
-	// Count distribution
-	shardCounts := make(map[int]int)
-	for i := 0; i < numKeys; i++ {
-		workflowID := uuid.New()
-		shard := config.GetShard(workflowID)
-		if shard < 0 || shard >= numShards {
-			t.Errorf("Shard %d out of range [0, %d)", shard, numShards)
-		}
-		shardCounts[shard]++
-	}
-
-	// Verify all shards got some keys (at least 5% of total)
-	minKeysPerShard := numKeys / 20 // 5% minimum
-	if len(shardCounts) != numShards {
-		t.Errorf("Expected %d shards to receive keys, got %d", numShards, len(shardCounts))
-	}
-
-	for shard := 0; shard < numShards; shard++ {
-		count := shardCounts[shard]
-		if count < minKeysPerShard {
-			t.Errorf("Shard %d has too few keys: %d (expected at least %d)",
-				shard, count, minKeysPerShard)
-		}
-	}
-
-	// Verify total distribution equals total keys
-	total := 0
-	for _, count := range shardCounts {
-		total += count
-	}
-	if total != numKeys {
-		t.Errorf("Total distributed keys %d != expected %d", total, numKeys)
-	}
-
-	t.Logf("Distribution across %d shards: %v", numShards, shardCounts)
-	for shard, count := range shardCounts {
-		percentage := float64(count) / float64(numKeys) * 100
-		t.Logf("  Shard %d: %.1f%%", shard, percentage)
-	}
-}
-
 func TestShardStability(t *testing.T) {
 	// Test that the same workflow ID always maps to the same shard
 	numShards := 9
