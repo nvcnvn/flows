@@ -201,48 +201,45 @@ func TestExplicitEngine_NoGlobalState(t *testing.T) {
 	assert.Equal(t, "Works without global state!", result.Message)
 }
 
-// TestExplicitEngine_CustomHashRing tests using custom hash ring with explicit engine
-func TestExplicitEngine_CustomHashRing(t *testing.T) {
+// TestExplicitEngine_CustomShardConfig tests using custom shard config with explicit engine
+func TestExplicitEngine_CustomShardConfig(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	pool := SetupTestDB(t)
 
-	// Create custom hash ring with 5 shards instead of default 3
-	hashRing := flows.NewConsistentHash(100)
-	for i := 0; i < 5; i++ {
-		hashRing.Add(i)
-	}
+	// Create custom shard config with 5 shards instead of default 9
+	shardConfig := flows.NewShardConfig(5)
 
-	// Create engine with custom hash ring
-	engine := flows.NewEngine(pool, flows.WithHashRing(hashRing))
+	// Create engine with custom shard config
+	engine := flows.NewEngine(pool, flows.WithShardConfig(shardConfig))
 
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
 	workflow := flows.New(
-		"custom-hashring-workflow",
+		"custom-shardconfig-workflow",
 		1,
 		func(ctx *flows.Context[ExplicitEngineInput]) (*ExplicitEngineOutput, error) {
 			return &ExplicitEngineOutput{
-				Message: "Custom hash ring: " + ctx.Input().Data,
+				Message: "Custom shard config: " + ctx.Input().Data,
 			}, nil
 		},
 	)
 
-	// Start workflow - should use custom hash ring for sharding
+	// Start workflow - should use custom shard config for sharding
 	exec, err := flows.StartWith(engine, ctx, workflow, &ExplicitEngineInput{
 		Data: "test-shard",
 	})
 	require.NoError(t, err)
 
-	// Worker should use same custom hash ring
+	// Worker should use same custom shard config
 	worker := flows.NewWorker(pool, flows.WorkerConfig{
-		WorkflowNames: []string{"custom-hashring-workflow"},
+		WorkflowNames: []string{"custom-shardconfig-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
 		TenantID:      tenantID,
-		HashRing:      hashRing, // Use same hash ring
+		Sharder:       shardConfig, // Use same sharder
 	})
 	defer worker.Stop()
 
@@ -258,28 +255,25 @@ func TestExplicitEngine_CustomHashRing(t *testing.T) {
 	// Verify workflow completes with custom sharding
 	result, err := flows.WaitForResultWith[ExplicitEngineOutput](engine, ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err)
-	assert.Equal(t, "Custom hash ring: test-shard", result.Message)
+	assert.Equal(t, "Custom shard config: test-shard", result.Message)
 
-	// Verify hash ring has 5 shards
-	assert.Equal(t, 5, hashRing.NumShards())
+	// Verify shard config has 5 shards
+	assert.Equal(t, 5, shardConfig.NumShards())
 }
 
-// TestExplicitEngine_MultipleEnginesWithDifferentHashRings tests multiple engines with different hash rings
-func TestExplicitEngine_MultipleEnginesWithDifferentHashRings(t *testing.T) {
+// TestExplicitEngine_MultipleEnginesWithDifferentShardConfigs tests multiple engines with different shard configs
+func TestExplicitEngine_MultipleEnginesWithDifferentShardConfigs(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	pool := SetupTestDB(t)
 
-	// Engine 1: Default hash ring (3 shards)
+	// Engine 1: Default shard config (9 shards)
 	engine1 := flows.NewEngine(pool)
 
-	// Engine 2: Custom hash ring (2 shards)
-	hashRing2 := flows.NewConsistentHash(100)
-	for i := 0; i < 2; i++ {
-		hashRing2.Add(i)
-	}
-	engine2 := flows.NewEngine(pool, flows.WithHashRing(hashRing2))
+	// Engine 2: Custom shard config (2 shards)
+	shardConfig2 := flows.NewShardConfig(2)
+	engine2 := flows.NewEngine(pool, flows.WithShardConfig(shardConfig2))
 
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
@@ -294,7 +288,7 @@ func TestExplicitEngine_MultipleEnginesWithDifferentHashRings(t *testing.T) {
 		},
 	)
 
-	// Start workflow with engine 1 (default 3 shards)
+	// Start workflow with engine 1 (default 9 shards)
 	exec1, err := flows.StartWith(engine1, ctx, workflow, &ExplicitEngineInput{
 		Data: "engine1",
 	})
@@ -306,23 +300,23 @@ func TestExplicitEngine_MultipleEnginesWithDifferentHashRings(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Worker for engine 1's hash ring (3 shards)
+	// Worker for engine 1's shard config (9 shards)
 	worker1 := flows.NewWorker(pool, flows.WorkerConfig{
 		WorkflowNames: []string{"multi-engine-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
 		TenantID:      tenantID,
-		// Uses default global hash ring (3 shards)
+		// Uses default global shard config (9 shards)
 	})
 	defer worker1.Stop()
 
-	// Worker for engine 2's hash ring (2 shards)
+	// Worker for engine 2's shard config (2 shards)
 	worker2 := flows.NewWorker(pool, flows.WorkerConfig{
 		WorkflowNames: []string{"multi-engine-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
 		TenantID:      tenantID,
-		HashRing:      hashRing2,
+		Sharder:       shardConfig2,
 	})
 	defer worker2.Stop()
 

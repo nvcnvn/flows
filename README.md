@@ -8,12 +8,11 @@
 
 ## 🎯 Key Features
 
+- **Transaction Support**: Atomic workflow starts, signals, queries with application state using `WithTx()`
 - **Type-Safe Generics**: Compile-time type checking for workflows and activities
 - **Deterministic Replay**: Fault-tolerant execution with automatic state recovery
 - **PostgreSQL Native**: Leverages PostgreSQL 18's UUIDv7 and JSONB features
 - **Multi-Tenant Isolation**: Built-in tenant isolation at the database level
-- **Transparent Sharding**: Consistent-hash based workflow distribution across shards
-- **Transaction Support**: Atomic workflow starts with application state using `WithTx()`
 - **Single Package API**: Clean, discoverable API with one import
 - **Simple**: Library-based, no separate cluster or infrastructure
 
@@ -27,15 +26,12 @@ go get github.com/nvcnvn/flows
 
 ## ⚡ Workflow Sharding
 
-Flows automatically distributes workflows across shards using **consistent hashing** based on workflow IDs:
-
 - **Original Workflow Names Required**: APIs accept the base workflow name (e.g., `"loan-application"`), not the sharded name
 - **Automatic Hash Suffix**: The library computes a shard suffix internally (e.g., `"loan-application-shard-0"`)
-- **Consistent Hashing**: Uses FNV-1a hash with 100 virtual nodes per shard for stable, balanced distribution
 - **Workers Poll All Shards**: Workers automatically poll all sharded variants of their workflow type
-- **Configurable**: Default 3 shards, configure via `flows.SetShardConfig()` before starting workflows
+- **Configurable**: Default 9 shards, configure via `flows.SetShardConfig()` before starting workflows
 
 ```go
 // You use the original name - sharding happens internally
-exec, err := flows.Start(ctx, MyWorkflow, input)  // -> "my-workflow-shard-{0,1,2}"
+exec, err := flows.Start(ctx, MyWorkflow, input)  // -> "my-workflow-shard-[0,8]"
 ```

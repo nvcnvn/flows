@@ -110,11 +110,11 @@ func main() {
 - Better for multi-database or sharded architectures
 - No global state
 
-## Custom Hash Ring Configuration
+## Custom Hash Configuration
 
-The library uses consistent hashing to distribute workflows across shards for horizontal scaling. You can customize the hash ring configuration.
+The library uses hashing to distribute workflows across shards for horizontal scaling. You can customize the hash configuration.
 
-### Global Hash Ring (Pattern 1)
+### Global Hash (Pattern 1)
 
 ```go
 package main
@@ -124,22 +124,19 @@ import (
 )
 
 func main() {
-    // Option 1: Use default (3 shards)
+    // Option 1: Use default (9 shards)
     // No configuration needed - automatically created on first use
     
-    // Option 2: Set custom hash ring globally
-    hashRing := flows.NewConsistentHash(100) // 100 virtual nodes per shard
-    for i := 0; i < 5; i++ {
-        hashRing.Add(i) // Add 5 shards
-    }
-    flows.SetHashRing(hashRing)
+    // Option 2: Set custom shard config globally
+    shardConfig := flows.NewShardConfig(16) // Use 16 shards
+    flows.SetShardConfig(shardConfig)
     
-    // Now all workflows use this hash ring
+    // Now all workflows use this shard config
     exec, err := flows.Start(ctx, myWorkflow, input)
 }
 ```
 
-### Explicit Hash Ring (Pattern 2)
+### Explicit Shard Config (Pattern 2)
 
 ```go
 package main
@@ -151,31 +148,68 @@ import (
 func main() {
     pool, _ := pgxpool.New(ctx, connString)
     
-    // Option 1: Engine with default hash ring
+    // Option 1: Engine with default shard config (9 shards)
     engine := flows.NewEngine(pool)
     
-    // Option 2: Engine with custom hash ring
-    hashRing := flows.NewConsistentHash(100)
-    for i := 0; i < 5; i++ {
-        hashRing.Add(i)
-    }
-    engine := flows.NewEngine(pool, flows.WithHashRing(hashRing))
+    // Option 2: Engine with custom shard config
+    sharder := flows.NewShardConfig(16) // Use 16 shards
+    engine := flows.NewEngine(pool, flows.WithSharder(sharder))
     
-    // Workers can use the same custom hash ring
+    // Workers can use the same custom sharder
     worker := flows.NewWorker(pool, flows.WorkerConfig{
         WorkflowNames: []string{"my-workflow"},
         Concurrency:   10,
         TenantID:      tenantID,
-        HashRing:      hashRing, // Use same hash ring as engine
+        Sharder:       sharder, // Use same sharder as engine
     })
 }
 ```
 
-**Hash Ring Best Practices:**
-- Use the same hash ring configuration across all engines and workers
-- Higher replicas (e.g., 100) provide better distribution but use more memory
-- Adding/removing shards with consistent hashing minimizes workflow reassignment
-- Default is 3 shards with 100 virtual nodes per shard
+**Shard Config Best Practices:**
+- Use the same shard configuration across all engines and workers
+- The number of shards is fixed at configuration time (no rebalancing)
+- Choose a shard count based on your expected scale (9 is default, good for most cases)
+
+### Custom Sharder Implementation
+
+You can implement your own sharding strategy by implementing the `Sharder` interface:
+
+```go
+package main
+
+import (
+    "github.com/google/uuid"
+    "github.com/nvcnvn/flows"
+)
+
+// CustomSharder implements custom sharding logic
+type CustomSharder struct {
+    numShards int
+}
+
+func (s *CustomSharder) GetShard(workflowID uuid.UUID) int {
+    // Your custom sharding logic here
+    // Example: use first byte of UUID
+    return int(workflowID[0]) % s.numShards
+}
+
+func (s *CustomSharder) NumShards() int {
+    return s.numShards
+}
+
+func main() {
+    pool, _ := pgxpool.New(ctx, connString)
+    
+    // Use custom sharder
+    sharder := &CustomSharder{numShards: 12}
+    engine := flows.NewEngine(pool, flows.WithSharder(sharder))
+    
+    worker := flows.NewWorker(pool, flows.WorkerConfig{
+        WorkflowNames: []string{"my-workflow"},
+        Sharder:       sharder, // Same sharder instance
+    })
+}
+```
 
 ## Pattern 3: Hybrid Approach
 

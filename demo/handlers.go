@@ -42,10 +42,10 @@ type SubmitApprovalRequest struct {
 // POST /api/loans
 // Example:
 //
-//	curl -X POST http://localhost:8080/api/loans \
+//	curl -X POST http://localhost:8081/api/loans \
 //	  -H "Content-Type: application/json" \
 //	  -d '{"applicant_name":"John Doe","amount":75000,"purpose":"home renovation"}'
-func createLoanHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) createLoanHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateLoanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -68,18 +68,15 @@ func createLoanHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Create engine
-	engine := flows.NewEngine(pool)
-	flows.SetEngine(engine)
-
-	// Start workflow
+	// Start workflow using explicit engine instance
+	// No need to create a new engine or set global state
 	input := &LoanApplicationInput{
 		ApplicantName: req.ApplicantName,
 		Amount:        req.Amount,
 		Purpose:       req.Purpose,
 	}
 
-	exec, err := flows.Start(ctx, LoanApplicationWorkflow, input)
+	exec, err := flows.StartWith(s.engine, ctx, LoanApplicationWorkflow, input)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to start workflow: %v", err))
 		return
@@ -97,8 +94,8 @@ func createLoanHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl "http://localhost:8080/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000"
-func getLoanStatusHandler(w http.ResponseWriter, r *http.Request) {
+//	curl "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000"
+func (s *Server) getLoanStatusHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract workflow name from path (base name, e.g., "loan-application")
 	workflowName := r.PathValue("workflowName")
 	if workflowName == "" {
@@ -119,8 +116,9 @@ func getLoanStatusHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Query workflow status using base name - sharding is handled internally
-	status, err := flows.Query(ctx, workflowName, workflowID)
+	// Query workflow status using explicit engine instance
+	// Sharding is handled internally using the engine's hash ring
+	status, err := flows.QueryWith(s.engine, ctx, workflowName, workflowID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Workflow not found: %v", err))
 		return
@@ -134,10 +132,10 @@ func getLoanStatusHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl -X POST "http://localhost:8080/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/documents" \
+//	curl -X POST "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/documents" \
 //	  -H "Content-Type: application/json" \
 //	  -d '{"document_type":"identity","document_id":"DL-123456789"}'
-func submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract workflow name from path (base name)
 	workflowName := r.PathValue("workflowName")
 	if workflowName == "" {
@@ -169,7 +167,8 @@ func submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Send signal using base name - sharding is handled internally
+	// Send signal using explicit engine instance
+	// Sharding is handled internally using the engine's hash ring
 	signalName := fmt.Sprintf("document-%s", req.DocumentType)
 	payload := &DocumentSubmission{
 		DocumentType: req.DocumentType,
@@ -177,7 +176,7 @@ func submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		UploadedAt:   time.Now(),
 	}
 
-	err = flows.SendSignal(ctx, workflowName, workflowID, signalName, payload)
+	err = flows.SendSignalWith(s.engine, ctx, workflowName, workflowID, signalName, payload)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to send signal: %v", err))
 		return
@@ -193,10 +192,10 @@ func submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl -X POST "http://localhost:8080/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/approve" \
+//	curl -X POST "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/approve" \
 //	  -H "Content-Type: application/json" \
 //	  -d '{"approver_role":"manager","approved":true,"comments":"Looks good"}'
-func submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract workflow name from path (base name)
 	workflowName := r.PathValue("workflowName")
 	if workflowName == "" {
@@ -223,7 +222,8 @@ func submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Send signal using base name - sharding is handled internally
+	// Send signal using explicit engine instance
+	// Sharding is handled internally using the engine's hash ring
 	signalName := "manager-approval"
 	payload := &ApprovalSignal{
 		ApproverRole: req.ApproverRole,
@@ -232,7 +232,7 @@ func submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
 		ApprovedAt:   time.Now(),
 	}
 
-	err = flows.SendSignal(ctx, workflowName, workflowID, signalName, payload)
+	err = flows.SendSignalWith(s.engine, ctx, workflowName, workflowID, signalName, payload)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to send approval signal: %v", err))
 		return
@@ -248,8 +248,8 @@ func submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl "http://localhost:8080/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/result"
-func getLoanResultHandler(w http.ResponseWriter, r *http.Request) {
+//	curl "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/result"
+func (s *Server) getLoanResultHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract workflow name from path (base name)
 	workflowName := r.PathValue("workflowName")
 	if workflowName == "" {
@@ -271,12 +271,9 @@ func getLoanResultHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Create engine
-	engine := flows.NewEngine(pool)
-	flows.SetEngine(engine)
-
-	// Get result using base name - sharding is handled internally
-	result, err := flows.GetResult[LoanApplicationOutput](ctx, workflowName, workflowID)
+	// Get result using explicit engine instance
+	// Sharding is handled internally using the engine's hash ring
+	result, err := flows.GetResultWith[LoanApplicationOutput](s.engine, ctx, workflowName, workflowID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get result: %v", err))
 		return

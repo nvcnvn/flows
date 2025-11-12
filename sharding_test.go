@@ -1,27 +1,27 @@
 package flows
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
 )
 
-func TestConsistentHashDistribution(t *testing.T) {
-	// Test that consistent hash distributes keys across shards
-	// Note: Consistent hashing prioritizes stability over perfect balance
-	numShards := 3
+func TestShardDistribution(t *testing.T) {
+	// Test that simple modulo-based sharding distributes keys evenly across shards
+	numShards := 9
 	numKeys := 10000
 
-	ch := NewConsistentHash(100) // 100 replicas per shard
-	for i := 0; i < numShards; i++ {
-		ch.Add(i)
-	}
+	config := NewShardConfig(numShards)
 
 	// Count distribution
 	shardCounts := make(map[int]int)
 	for i := 0; i < numKeys; i++ {
-		key := uuid.New().String()
-		shard := ch.Get(key)
+		workflowID := uuid.New()
+		shard := config.GetShard(workflowID)
+		if shard < 0 || shard >= numShards {
+			t.Errorf("Shard %d out of range [0, %d)", shard, numShards)
+		}
 		shardCounts[shard]++
 	}
 
@@ -55,89 +55,34 @@ func TestConsistentHashDistribution(t *testing.T) {
 	}
 }
 
-func TestConsistentHashStability(t *testing.T) {
-	// Test that the same key always maps to the same shard
-	numShards := 3
-	ch := NewConsistentHash(100)
-	for i := 0; i < numShards; i++ {
-		ch.Add(i)
-	}
+func TestShardStability(t *testing.T) {
+	// Test that the same workflow ID always maps to the same shard
+	numShards := 9
+	config := NewShardConfig(numShards)
 
-	// Generate test keys and their shard assignments
-	testKeys := make([]string, 100)
+	// Generate test workflow IDs and their shard assignments
+	testIDs := make([]uuid.UUID, 100)
 	expectedShards := make([]int, 100)
 	for i := 0; i < 100; i++ {
-		testKeys[i] = uuid.New().String()
-		expectedShards[i] = ch.Get(testKeys[i])
+		testIDs[i] = uuid.New()
+		expectedShards[i] = config.GetShard(testIDs[i])
 	}
 
-	// Verify keys map to same shard on repeated lookups
+	// Verify workflow IDs map to same shard on repeated lookups
 	for i := 0; i < 100; i++ {
-		shard := ch.Get(testKeys[i])
+		shard := config.GetShard(testIDs[i])
 		if shard != expectedShards[i] {
-			t.Errorf("Key %s mapped to shard %d on first lookup, but shard %d on second lookup",
-				testKeys[i], expectedShards[i], shard)
+			t.Errorf("Workflow ID %s mapped to shard %d on first lookup, but shard %d on second lookup",
+				testIDs[i], expectedShards[i], shard)
 		}
 	}
-}
-
-func TestConsistentHashMinimalReassignment(t *testing.T) {
-	// Test that adding a shard only reassigns ~1/N keys
-	initialShards := 3
-	numKeys := 10000
-
-	// Create initial hash ring with 3 shards
-	ch := NewConsistentHash(100)
-	for i := 0; i < initialShards; i++ {
-		ch.Add(i)
-	}
-
-	// Map keys to initial shards
-	testKeys := make([]string, numKeys)
-	initialMapping := make(map[string]int)
-	for i := 0; i < numKeys; i++ {
-		testKeys[i] = uuid.New().String()
-		initialMapping[testKeys[i]] = ch.Get(testKeys[i])
-	}
-
-	// Add a new shard
-	ch.Add(initialShards)
-
-	// Count how many keys were reassigned
-	reassigned := 0
-	for _, key := range testKeys {
-		newShard := ch.Get(key)
-		if newShard != initialMapping[key] {
-			reassigned++
-		}
-	}
-
-	// With consistent hashing, ~1/(N+1) keys should be reassigned when adding 1 shard
-	// For 3 -> 4 shards, expect ~25% reassignment, but allow wider tolerance
-	// since actual distribution depends on hash function and virtual nodes
-
-	// Allow 10-40% reassignment range (consistent hashing may vary)
-	minReassignment := float64(numKeys) * 0.10
-	maxReassignment := float64(numKeys) * 0.40
-
-	if float64(reassigned) < minReassignment || float64(reassigned) > maxReassignment {
-		t.Errorf("Expected 10-40%% keys to be reassigned when adding shard, got %d (%.1f%%)",
-			reassigned, float64(reassigned)/float64(numKeys)*100)
-	}
-
-	t.Logf("Adding shard %d: %d/%d keys reassigned (%.1f%%)",
-		initialShards, reassigned, numKeys,
-		float64(reassigned)/float64(numKeys)*100)
 }
 
 func TestGetShardForWorkflow(t *testing.T) {
 	t.Parallel()
 
-	// Create test hash ring with 3 shards
-	hashRing := NewConsistentHash(100)
-	for i := 0; i < 3; i++ {
-		hashRing.Add(i)
-	}
+	// Create test shard config with 9 shards
+	shardConfig := NewShardConfig(9)
 
 	// Test that workflow IDs consistently map to shards
 	testWorkflows := []uuid.UUID{
@@ -151,9 +96,9 @@ func TestGetShardForWorkflow(t *testing.T) {
 	// Get initial shard assignments
 	shardAssignments := make(map[uuid.UUID]int)
 	for _, wfID := range testWorkflows {
-		shard := getShardForWorkflow(wfID, hashRing)
-		if shard < 0 || shard >= 3 {
-			t.Errorf("Shard %d out of range [0, 3) for workflow %s", shard, wfID)
+		shard := getShardForWorkflow(wfID, shardConfig)
+		if shard < 0 || shard >= 9 {
+			t.Errorf("Shard %d out of range [0, 9) for workflow %s", shard, wfID)
 		}
 		shardAssignments[wfID] = shard
 	}
@@ -161,7 +106,7 @@ func TestGetShardForWorkflow(t *testing.T) {
 	// Verify consistency - same workflow ID should always get same shard
 	for i := 0; i < 10; i++ {
 		for wfID, expectedShard := range shardAssignments {
-			shard := getShardForWorkflow(wfID, hashRing)
+			shard := getShardForWorkflow(wfID, shardConfig)
 			if shard != expectedShard {
 				t.Errorf("Workflow %s got shard %d, expected %d (iteration %d)",
 					wfID, shard, expectedShard, i)
@@ -173,20 +118,17 @@ func TestGetShardForWorkflow(t *testing.T) {
 func TestGetShardedWorkflowName(t *testing.T) {
 	t.Parallel()
 
-	// Create test hash ring with 3 shards
-	hashRing := NewConsistentHash(100)
-	for i := 0; i < 3; i++ {
-		hashRing.Add(i)
-	}
+	// Create test shard config with 9 shards
+	shardConfig := NewShardConfig(9)
 
 	baseName := "test-workflow"
 	workflowID := uuid.New()
 
-	shardedName := getShardedWorkflowName(baseName, workflowID, hashRing)
+	shardedName := getShardedWorkflowName(baseName, workflowID, shardConfig)
 
 	// Verify format
-	expectedShard := getShardForWorkflow(workflowID, hashRing)
-	expectedName := "test-workflow-shard-" + string(rune('0'+expectedShard))
+	expectedShard := getShardForWorkflow(workflowID, shardConfig)
+	expectedName := fmt.Sprintf("test-workflow-shard-%d", expectedShard)
 
 	if shardedName != expectedName {
 		t.Errorf("Expected sharded name %s, got %s", expectedName, shardedName)
@@ -194,7 +136,7 @@ func TestGetShardedWorkflowName(t *testing.T) {
 
 	// Verify consistency
 	for i := 0; i < 10; i++ {
-		name := getShardedWorkflowName(baseName, workflowID, hashRing)
+		name := getShardedWorkflowName(baseName, workflowID, shardConfig)
 		if name != shardedName {
 			t.Errorf("Sharded name changed from %s to %s on iteration %d",
 				shardedName, name, i)
@@ -205,14 +147,11 @@ func TestGetShardedWorkflowName(t *testing.T) {
 func TestGetAllShardedWorkflowNames(t *testing.T) {
 	t.Parallel()
 
-	// Create test hash ring with 5 shards
-	hashRing := NewConsistentHash(100)
-	for i := 0; i < 5; i++ {
-		hashRing.Add(i)
-	}
+	// Create test shard config with 5 shards
+	shardConfig := NewShardConfig(5)
 
 	baseName := "my-workflow"
-	names := getAllShardedWorkflowNames(baseName, hashRing)
+	names := getAllShardedWorkflowNames(baseName, shardConfig)
 
 	if len(names) != 5 {
 		t.Errorf("Expected 5 sharded names, got %d", len(names))
@@ -259,14 +198,11 @@ func TestExtractBaseWorkflowName(t *testing.T) {
 	}
 }
 
-func TestHashRingThreadSafety(t *testing.T) {
+func TestShardConfigThreadSafety(t *testing.T) {
 	t.Parallel()
 
-	// Test concurrent reads and writes to hash ring
-	hashRing := NewConsistentHash(100)
-	for i := 0; i < 3; i++ {
-		hashRing.Add(i)
-	}
+	// Test concurrent reads to shard config
+	shardConfig := NewShardConfig(9)
 
 	done := make(chan bool)
 
@@ -275,7 +211,7 @@ func TestHashRingThreadSafety(t *testing.T) {
 		go func() {
 			for j := 0; j < 100; j++ {
 				workflowID := uuid.New()
-				shard := getShardForWorkflow(workflowID, hashRing)
+				shard := getShardForWorkflow(workflowID, shardConfig)
 				if shard < 0 {
 					t.Errorf("getShardForWorkflow returned negative shard")
 				}
@@ -288,8 +224,8 @@ func TestHashRingThreadSafety(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		go func() {
 			for j := 0; j < 50; j++ {
-				key := uuid.New().String()
-				hashRing.Get(key)
+				workflowID := uuid.New()
+				shardConfig.GetShard(workflowID)
 			}
 			done <- true
 		}()
@@ -301,40 +237,8 @@ func TestHashRingThreadSafety(t *testing.T) {
 	}
 }
 
-func TestConsistentHashEmptyRing(t *testing.T) {
-	t.Parallel()
-
-	ch := NewConsistentHash(100)
-
-	// Getting from empty ring should return 0
-	shard := ch.Get("test-key")
-	if shard != 0 {
-		t.Errorf("Expected shard 0 for empty ring, got %d", shard)
-	}
-}
-
-func BenchmarkConsistentHashGet(b *testing.B) {
-	ch := NewConsistentHash(100)
-	for i := 0; i < 10; i++ {
-		ch.Add(i)
-	}
-
-	keys := make([]string, 1000)
-	for i := 0; i < 1000; i++ {
-		keys[i] = uuid.New().String()
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		ch.Get(keys[i%1000])
-	}
-}
-
-func BenchmarkGetShardForWorkflow(b *testing.B) {
-	hashRing := NewConsistentHash(100)
-	for i := 0; i < 10; i++ {
-		hashRing.Add(i)
-	}
+func BenchmarkShardConfigGetShard(b *testing.B) {
+	config := NewShardConfig(9)
 
 	workflowIDs := make([]uuid.UUID, 1000)
 	for i := 0; i < 1000; i++ {
@@ -343,6 +247,20 @@ func BenchmarkGetShardForWorkflow(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		getShardForWorkflow(workflowIDs[i%1000], hashRing)
+		config.GetShard(workflowIDs[i%1000])
+	}
+}
+
+func BenchmarkGetShardForWorkflow(b *testing.B) {
+	shardConfig := NewShardConfig(9)
+
+	workflowIDs := make([]uuid.UUID, 1000)
+	for i := 0; i < 1000; i++ {
+		workflowIDs[i] = uuid.New()
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		getShardForWorkflow(workflowIDs[i%1000], shardConfig)
 	}
 }

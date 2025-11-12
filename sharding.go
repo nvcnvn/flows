@@ -3,174 +3,184 @@ package flows
 import (
 	"fmt"
 	"hash/fnv"
-	"sort"
 	"sync"
 
 	"github.com/google/uuid"
 )
 
 // DefaultNumShards is the default number of shards for workflow distribution.
-const DefaultNumShards = 3
+// Using 9 shards (0-8) provides good distribution while keeping management simple.
+const DefaultNumShards = 9
 
-// ConsistentHash implements consistent hashing for distributed workflow placement.
-// Uses virtual nodes (replicas) to ensure balanced distribution when adding/removing shards.
-type ConsistentHash struct {
-	replicas int         // Number of virtual nodes per shard
-	keys     []int       // Sorted hash ring
-	hashMap  map[int]int // Hash to shard mapping
-	mu       sync.RWMutex
+// Sharder is the interface for workflow sharding strategies.
+// Implementations must be thread-safe.
+//
+// Example custom implementation:
+//
+//	type CustomSharder struct {
+//		numShards int
+//		mu        sync.RWMutex
+//	}
+//
+//	func (s *CustomSharder) GetShard(workflowID uuid.UUID) int {
+//		s.mu.RLock()
+//		defer s.mu.RUnlock()
+//		// Your custom logic here - use first byte of UUID
+//		return int(workflowID[0]) % s.numShards
+//	}
+//
+//	func (s *CustomSharder) NumShards() int {
+//		s.mu.RLock()
+//		defer s.mu.RUnlock()
+//		return s.numShards
+//	}
+//
+// Then use it:
+//
+//	sharder := &CustomSharder{numShards: 12}
+//	engine := flows.NewEngine(pool, flows.WithSharder(sharder))
+type Sharder interface {
+	// GetShard returns the shard number (0-based) for a given workflow ID.
+	// Must be deterministic - same workflow ID always returns same shard.
+	GetShard(workflowID uuid.UUID) int
+
+	// NumShards returns the total number of shards.
+	NumShards() int
 }
 
-// NewConsistentHash creates a new consistent hash ring with the given number of replicas.
-// Higher replicas provide better distribution but use more memory.
-func NewConsistentHash(replicas int) *ConsistentHash {
-	return &ConsistentHash{
-		replicas: replicas,
-		hashMap:  make(map[int]int),
+// ShardConfig holds the sharding configuration for workflow distribution.
+// It uses simple modulo-based hashing to distribute workflows across fixed shards.
+type ShardConfig struct {
+	numShards int
+	mu        sync.RWMutex
+}
+
+// Ensure ShardConfig implements Sharder interface
+var _ Sharder = (*ShardConfig)(nil)
+
+// NewShardConfig creates a new shard configuration with the specified number of shards.
+// The number of shards is fixed at creation time and cannot be changed.
+func NewShardConfig(numShards int) *ShardConfig {
+	if numShards <= 0 {
+		numShards = DefaultNumShards
+	}
+	return &ShardConfig{
+		numShards: numShards,
 	}
 }
 
-// Add adds a shard to the hash ring.
-func (h *ConsistentHash) Add(shard int) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+// GetShard returns the shard number for a given workflow ID.
+// Uses FNV-1a hash with modulo to distribute workflows evenly across shards.
+// The shard assignment for a workflow ID is deterministic and stable.
+func (s *ShardConfig) GetShard(workflowID uuid.UUID) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	for i := 0; i < h.replicas; i++ {
-		key := h.hash(fmt.Sprintf("%d-%d", shard, i))
-		h.keys = append(h.keys, key)
-		h.hashMap[key] = shard
-	}
-	sort.Ints(h.keys)
-}
-
-// Get returns the shard for a given key using consistent hashing.
-func (h *ConsistentHash) Get(key string) int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	if len(h.keys) == 0 {
-		return 0
-	}
-
-	hash := h.hash(key)
-
-	// Binary search for the first node >= hash
-	idx := sort.Search(len(h.keys), func(i int) bool {
-		return h.keys[i] >= hash
-	})
-
-	// Wrap around if we're past the end
-	if idx == len(h.keys) {
-		idx = 0
-	}
-
-	return h.hashMap[h.keys[idx]]
-}
-
-// hash computes FNV-1a hash for a string.
-func (h *ConsistentHash) hash(key string) int {
 	hasher := fnv.New32a()
-	hasher.Write([]byte(key))
-	return int(hasher.Sum32())
+	hasher.Write([]byte(workflowID.String()))
+	hash := hasher.Sum32()
+
+	return int(hash % uint32(s.numShards))
 }
 
-// NumShards returns the number of shards in this hash ring.
-func (h *ConsistentHash) NumShards() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	// Count unique shards
-	shards := make(map[int]bool)
-	for _, shard := range h.hashMap {
-		shards[shard] = true
-	}
-	return len(shards)
+// NumShards returns the number of shards in this configuration.
+func (s *ShardConfig) NumShards() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.numShards
 }
 
-// NewDefaultHashRing creates a hash ring with the default configuration (3 shards, 100 replicas).
-func NewDefaultHashRing() *ConsistentHash {
-	h := NewConsistentHash(100) // 100 virtual nodes per shard
-	for i := 0; i < DefaultNumShards; i++ {
-		h.Add(i)
-	}
-	return h
+// NewDefaultShardConfig creates a shard configuration with the default number of shards (9).
+func NewDefaultShardConfig() *ShardConfig {
+	return NewShardConfig(DefaultNumShards)
 }
 
-// Global consistent hash ring
+// Global sharder instance
 var (
-	globalHashRing   *ConsistentHash
-	globalHashRingMu sync.RWMutex
+	globalSharder   Sharder
+	globalSharderMu sync.RWMutex
 )
 
-// SetHashRing sets the global hash ring instance for use with package-level functions.
-// This is optional - you can also pass custom hash rings to Engine/Worker.
+// SetSharder sets the global sharder for use with package-level functions.
+// This is optional - you can also pass custom sharders to Engine/Worker.
 //
-// Example with global hash ring:
+// Example with default shard config:
 //
-//	hashRing := flows.NewDefaultHashRing()
-//	flows.SetHashRing(hashRing)
+//	sharder := flows.NewDefaultShardConfig()
+//	flows.SetSharder(sharder)
 //	exec, err := flows.Start(ctx, myWorkflow, input)
 //
-// Example with custom shards:
+// Example with custom number of shards:
 //
-//	hashRing := flows.NewConsistentHash(100)
-//	for i := 0; i < 5; i++ {
-//		hashRing.Add(i)
-//	}
-//	flows.SetHashRing(hashRing)
-func SetHashRing(hashRing *ConsistentHash) {
-	globalHashRingMu.Lock()
-	defer globalHashRingMu.Unlock()
-	globalHashRing = hashRing
+//	sharder := flows.NewShardConfig(16) // 16 shards instead of default 9
+//	flows.SetSharder(sharder)
+//
+// Example with custom sharder implementation:
+//
+//	type MyCustomSharder struct {}
+//	func (s *MyCustomSharder) GetShard(workflowID uuid.UUID) int { /* custom logic */ }
+//	func (s *MyCustomSharder) NumShards() int { return 10 }
+//
+//	flows.SetSharder(&MyCustomSharder{})
+func SetSharder(sharder Sharder) {
+	globalSharderMu.Lock()
+	defer globalSharderMu.Unlock()
+	globalSharder = sharder
 }
 
-// getGlobalHashRing safely retrieves the global hash ring instance.
-// If not set, returns a default hash ring with 3 shards.
-func getGlobalHashRing() *ConsistentHash {
-	globalHashRingMu.RLock()
-	defer globalHashRingMu.RUnlock()
+// SetShardConfig is a convenience function that sets the global sharder to a ShardConfig.
+// For custom sharder implementations, use SetSharder instead.
+func SetShardConfig(config *ShardConfig) {
+	SetSharder(config)
+}
 
-	if globalHashRing == nil {
-		// Return default hash ring if not set
-		globalHashRingMu.RUnlock()
-		globalHashRingMu.Lock()
-		if globalHashRing == nil {
-			globalHashRing = NewDefaultHashRing()
+// getGlobalSharder safely retrieves the global sharder.
+// If not set, returns a default configuration with 9 shards.
+func getGlobalSharder() Sharder {
+	globalSharderMu.RLock()
+	defer globalSharderMu.RUnlock()
+
+	if globalSharder == nil {
+		// Return default shard config if not set
+		globalSharderMu.RUnlock()
+		globalSharderMu.Lock()
+		if globalSharder == nil {
+			globalSharder = NewDefaultShardConfig()
 		}
-		globalHashRingMu.Unlock()
-		globalHashRingMu.RLock()
+		globalSharderMu.Unlock()
+		globalSharderMu.RLock()
 	}
 
-	return globalHashRing
+	return globalSharder
 }
 
-// getShardForWorkflow returns the shard number for a given workflow ID using consistent hashing.
-// If hashRing is nil, uses the global hash ring.
-func getShardForWorkflow(workflowID uuid.UUID, hashRing *ConsistentHash) int {
-	if hashRing == nil {
-		hashRing = getGlobalHashRing()
+// getShardForWorkflow returns the shard number for a given workflow ID.
+// If sharder is nil, uses the global sharder.
+func getShardForWorkflow(workflowID uuid.UUID, sharder Sharder) int {
+	if sharder == nil {
+		sharder = getGlobalSharder()
 	}
-	return hashRing.Get(workflowID.String())
+	return sharder.GetShard(workflowID)
 }
 
 // getShardedWorkflowName returns the workflow name with shard suffix.
 // Format: "{baseName}-shard-{shardNum}"
-// Example: "loan-application-workflow" -> "loan-application-workflow-shard-0"
-// If hashRing is nil, uses the global hash ring.
-func getShardedWorkflowName(baseName string, workflowID uuid.UUID, hashRing *ConsistentHash) string {
-	shard := getShardForWorkflow(workflowID, hashRing)
+// Example: "loan-application-workflow" -> "loan-application-workflow-shard-3"
+// If sharder is nil, uses the global sharder.
+func getShardedWorkflowName(baseName string, workflowID uuid.UUID, sharder Sharder) string {
+	shard := getShardForWorkflow(workflowID, sharder)
 	return fmt.Sprintf("%s-shard-%d", baseName, shard)
 }
 
 // getAllShardedWorkflowNames returns all possible sharded names for a workflow type.
 // Workers should poll all shards for their workflow type.
-// Example: "loan-application-workflow" -> ["...-shard-0", "...-shard-1", "...-shard-2"]
-// If hashRing is nil, uses the global hash ring.
-func getAllShardedWorkflowNames(baseName string, hashRing *ConsistentHash) []string {
-	if hashRing == nil {
-		hashRing = getGlobalHashRing()
+// Example: "loan-application-workflow" -> ["...-shard-0", "...-shard-1", ..., "...-shard-8"]
+// If sharder is nil, uses the global sharder.
+func getAllShardedWorkflowNames(baseName string, sharder Sharder) []string {
+	if sharder == nil {
+		sharder = getGlobalSharder()
 	}
-	numShards := hashRing.NumShards()
+	numShards := sharder.NumShards()
 	names := make([]string, numShards)
 	for i := 0; i < numShards; i++ {
 		names[i] = fmt.Sprintf("%s-shard-%d", baseName, i)

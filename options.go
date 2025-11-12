@@ -105,3 +105,27 @@ func getRerunConfig(opts []RerunOption) *rerunConfig {
 	}
 	return cfg
 }
+
+// QueryOption is a function that configures query behavior.
+type QueryOption func(*queryConfig)
+
+// queryConfig holds configuration for querying workflows.
+type queryConfig struct {
+	tx Tx
+}
+
+// WithQueryTx configures the query to execute within an existing transaction.
+func WithQueryTx(tx Tx) QueryOption {
+	return func(c *queryConfig) {
+		c.tx = tx
+	}
+}
+
+// getQueryConfig applies options and returns the final configuration.
+func getQueryConfig(opts []QueryOption) *queryConfig {
+	cfg := &queryConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg
+}

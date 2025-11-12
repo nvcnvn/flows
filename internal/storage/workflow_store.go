@@ -38,7 +38,7 @@ func (s *Store) CreateWorkflow(ctx context.Context, wf *WorkflowModel, tx interf
 
 // GetWorkflow retrieves a workflow by ID.
 // workflow_name must be provided first for efficient shard routing in Citus.
-func (s *Store) GetWorkflow(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID) (*WorkflowModel, error) {
+func (s *Store) GetWorkflow(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID, tx ...interface{}) (*WorkflowModel, error) {
 	query := `
 		SELECT id, tenant_id, name, version, status, input, output, 
 		       error, sequence_num, activity_results, updated_at
@@ -47,11 +47,23 @@ func (s *Store) GetWorkflow(ctx context.Context, workflowName string, tenantID, 
 	`
 
 	wf := &WorkflowModel{}
-	err := s.pool.QueryRow(ctx, query, workflowName, tenantID, workflowID).Scan(
-		&wf.ID, &wf.TenantID, &wf.Name, &wf.Version, &wf.Status,
-		&wf.Input, &wf.Output, &wf.Error, &wf.SequenceNum,
-		&wf.ActivityResults, &wf.UpdatedAt,
-	)
+	var err error
+
+	if len(tx) > 0 && tx[0] != nil {
+		if pgxTx, ok := tx[0].(pgx.Tx); ok {
+			err = pgxTx.QueryRow(ctx, query, workflowName, tenantID, workflowID).Scan(
+				&wf.ID, &wf.TenantID, &wf.Name, &wf.Version, &wf.Status,
+				&wf.Input, &wf.Output, &wf.Error, &wf.SequenceNum,
+				&wf.ActivityResults, &wf.UpdatedAt,
+			)
+		}
+	} else {
+		err = s.pool.QueryRow(ctx, query, workflowName, tenantID, workflowID).Scan(
+			&wf.ID, &wf.TenantID, &wf.Name, &wf.Version, &wf.Status,
+			&wf.Input, &wf.Output, &wf.Error, &wf.SequenceNum,
+			&wf.ActivityResults, &wf.UpdatedAt,
+		)
+	}
 
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("workflow not found")

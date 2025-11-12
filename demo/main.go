@@ -14,10 +14,15 @@ import (
 	"github.com/nvcnvn/flows"
 )
 
-var (
-	pool   *pgxpool.Pool
-	worker *flows.Worker
-)
+// Server holds shared resources for the application
+// This demonstrates the instance-based pattern where a single pool, engine,
+// and shard config are created once and reused throughout the application.
+type Server struct {
+	pool        *pgxpool.Pool
+	engine      *flows.Engine
+	shardConfig *flows.ShardConfig
+	worker      *flows.Worker
+}
 
 func main() {
 	ctx := context.Background()
@@ -28,8 +33,7 @@ func main() {
 		connString = "postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable"
 	}
 
-	var err error
-	pool, err = pgxpool.New(ctx, connString)
+	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -41,19 +45,38 @@ func main() {
 	}
 	log.Println("✅ Connected to database")
 
+	// Create sharder (9 shards by default, or customize)
+	// In production, use the same sharder across all instances
+	sharder := flows.NewShardConfig(16) // Use 16 shards for better scaling
+	log.Printf("✅ Created sharder with %d shards", sharder.NumShards())
+
+	// Create engine with custom sharder
+	// This engine instance will be reused for all workflow operations
+	engine := flows.NewEngine(pool, flows.WithSharder(sharder))
+	log.Println("✅ Created workflow engine")
+
+	// Create server with shared resources
+	server := &Server{
+		pool:        pool,
+		engine:      engine,
+		shardConfig: sharder,
+	}
+
 	// Note: Workflows and activities are registered in workflow.go and activities.go
 
-	// Start worker
-	worker = flows.NewWorker(pool, flows.WorkerConfig{
+	// Start worker with the same sharder
+	// This ensures worker polls the correct sharded workflow queues
+	server.worker = flows.NewWorker(pool, flows.WorkerConfig{
 		Concurrency:       5,
 		WorkflowNames:     []string{"loan-application"},
 		PollInterval:      1 * time.Second,
 		VisibilityTimeout: 5 * time.Minute,
+		Sharder:           sharder, // Use same sharder as engine
 	})
 
 	go func() {
 		log.Println("🚀 Starting workflow worker...")
-		if err := worker.Run(ctx); err != nil {
+		if err := server.worker.Run(ctx); err != nil {
 			log.Printf("Worker error: %v", err)
 		}
 	}()
@@ -62,19 +85,20 @@ func main() {
 	mux := http.NewServeMux()
 
 	// API routes - workflow name is now in path for clarity
-	mux.HandleFunc("POST /api/loans", createLoanHandler)
-	mux.HandleFunc("GET /api/loans/{workflowName}/{id}", getLoanStatusHandler)
-	mux.HandleFunc("POST /api/loans/{workflowName}/{id}/documents", submitDocumentHandler)
-	mux.HandleFunc("POST /api/loans/{workflowName}/{id}/approve", submitApprovalHandler)
-	mux.HandleFunc("GET /api/loans/{workflowName}/{id}/result", getLoanResultHandler)
+	// Handler methods have access to server.engine for explicit API calls
+	mux.HandleFunc("POST /api/loans", server.createLoanHandler)
+	mux.HandleFunc("GET /api/loans/{workflowName}/{id}", server.getLoanStatusHandler)
+	mux.HandleFunc("POST /api/loans/{workflowName}/{id}/documents", server.submitDocumentHandler)
+	mux.HandleFunc("POST /api/loans/{workflowName}/{id}/approve", server.submitApprovalHandler)
+	mux.HandleFunc("GET /api/loans/{workflowName}/{id}/result", server.getLoanResultHandler)
 
 	// Health check
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	// Start server
-	server := &http.Server{
+	// Start HTTP server
+	httpServer := &http.Server{
 		Addr:    ":8081",
 		Handler: loggingMiddleware(mux),
 	}
@@ -82,7 +106,8 @@ func main() {
 	// Graceful shutdown
 	go func() {
 		log.Println("🌐 Server starting on http://localhost:8081")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("📊 Using %d shards for workflow distribution", sharder.NumShards())
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
@@ -96,8 +121,8 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	worker.Stop()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	server.worker.Stop()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 	}
 	log.Println("✅ Shutdown complete")
