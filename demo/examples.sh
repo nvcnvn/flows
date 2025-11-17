@@ -9,7 +9,7 @@
 
 set -e
 
-API_URL="${API_URL:-http://localhost:8081}"
+API_URL="${API_URL:-http://localhost:8181}"
 WORKFLOW_ID=""
 WORKFLOW_NAME=""
 

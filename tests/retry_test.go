@@ -121,12 +121,15 @@ func TestActivityRetry_Success(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"retry-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -194,12 +197,15 @@ func TestActivityRetry_MaxAttemptsExceeded(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"retry-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -277,12 +283,15 @@ func TestActivityRetry_TerminalError(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"terminal-error-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {

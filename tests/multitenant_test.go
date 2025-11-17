@@ -116,37 +116,24 @@ func TestMultiTenantIsolation(t *testing.T) {
 	t.Logf("Tenant 1 workflow: %s", exec1.WorkflowID())
 	t.Logf("Tenant 2 workflow: %s", exec2.WorkflowID())
 
-	// Start workers for each tenant
-	worker1 := flows.NewWorker(pool, flows.WorkerConfig{
-		Concurrency:   2,
+	// Start worker that processes workflows for all tenants
+	worker := flows.NewWorker(pool, flows.WorkerConfig{
+		Concurrency:   4,
 		WorkflowNames: []string{"simple-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenant1,
 	})
-	defer worker1.Stop()
 
-	worker2 := flows.NewWorker(pool, flows.WorkerConfig{
-		Concurrency:   2,
-		WorkflowNames: []string{"simple-workflow"},
-		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenant2,
-	})
-	defer worker2.Stop()
+	workerCtx, cancel := context.WithCancel(ctx)
 
-	worker1Ctx, cancel1 := context.WithCancel(ctx)
-	defer cancel1()
-	worker2Ctx, cancel2 := context.WithCancel(ctx)
-	defer cancel2()
-
-	go func() {
-		if err := worker1.Run(worker1Ctx); err != nil && err != context.Canceled {
-			t.Logf("Worker 1 error: %v", err)
-		}
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
 	}()
 
 	go func() {
-		if err := worker2.Run(worker2Ctx); err != nil && err != context.Canceled {
-			t.Logf("Worker 2 error: %v", err)
+		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
+			t.Logf("Worker error: %v", err)
 		}
 	}()
 
@@ -229,26 +216,34 @@ func TestMultiTenantWorkerIsolation(t *testing.T) {
 	exec2, err := flows.Start(ctx2, SimpleWorkflow, &SimpleInput{Value: "tenant2"})
 	require.NoError(t, err)
 
-	// Start worker ONLY for tenant1
-	worker1 := flows.NewWorker(pool, flows.WorkerConfig{
+	// Start a single worker - it processes workflows from all tenants
+	// This simulates production where workers are not tenant-specific
+	worker := flows.NewWorker(pool, flows.WorkerConfig{
 		Concurrency:   2,
 		WorkflowNames: []string{"simple-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenant1, // Only processes tenant1
 	})
-	defer worker1.Stop()
 
-	worker1Ctx, cancel1 := context.WithCancel(ctx)
-	defer cancel1()
+	workerCtx, cancel := context.WithCancel(ctx)
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
-		if err := worker1.Run(worker1Ctx); err != nil && err != context.Canceled {
-			t.Logf("Worker 1 error: %v", err)
+		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
+			t.Logf("Worker error: %v", err)
 		}
 	}()
 
-	// Tenant 1 should complete
+	// Both tenants should complete with single worker
 	resultChan1 := make(chan struct {
+		result *SimpleOutput
+		err    error
+	})
+	resultChan2 := make(chan struct {
 		result *SimpleOutput
 		err    error
 	})
@@ -261,41 +256,31 @@ func TestMultiTenantWorkerIsolation(t *testing.T) {
 		}{result, err}
 	}()
 
-	select {
-	case res := <-resultChan1:
-		require.NoError(t, res.err)
-		assert.Equal(t, "processed: tenant1", res.result.Result)
-		t.Log("Tenant 1 completed as expected")
-	case <-time.After(15 * time.Second):
-		t.Fatal("Tenant 1 should have completed")
-	}
-
-	// Tenant 2 should NOT complete (no worker)
-	resultChan2 := make(chan struct {
-		result *SimpleOutput
-		err    error
-	})
-
 	go func() {
-		timeoutCtx, cancel := context.WithTimeout(ctx2, 5*time.Second)
-		defer cancel()
-		result, err := exec2.Get(timeoutCtx)
+		result, err := exec2.Get(ctx2)
 		resultChan2 <- struct {
 			result *SimpleOutput
 			err    error
 		}{result, err}
 	}()
 
+	// Wait for both tenants to complete
+	select {
+	case res := <-resultChan1:
+		require.NoError(t, res.err)
+		assert.Equal(t, "processed: tenant1", res.result.Result)
+		t.Log("Tenant 1 completed")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Tenant 1 should have completed")
+	}
+
 	select {
 	case res := <-resultChan2:
-		// Should timeout or be in progress
-		if res.err != nil {
-			t.Logf("Tenant 2 correctly did not complete: %v", res.err)
-		} else {
-			t.Fatal("Tenant 2 should not have completed without dedicated worker")
-		}
-	case <-time.After(7 * time.Second):
-		t.Log("Tenant 2 correctly timed out (no worker)")
+		require.NoError(t, res.err)
+		assert.Equal(t, "processed: tenant2", res.result.Result)
+		t.Log("Tenant 2 completed")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Tenant 2 should have completed")
 	}
 }
 
@@ -321,37 +306,24 @@ func TestMultiTenantSignalIsolation(t *testing.T) {
 	exec2, err := flows.Start(ctx2, TenantSignalWorkflow, &TenantSignalInput{TenantAlias: "tenant2"})
 	require.NoError(t, err)
 
-	worker1 := flows.NewWorker(pool, flows.WorkerConfig{
-		Concurrency:   2,
+	// Single worker processes workflows from all tenants
+	worker := flows.NewWorker(pool, flows.WorkerConfig{
+		Concurrency:   4,
 		WorkflowNames: []string{"tenant-signal-workflow"},
 		PollInterval:  200 * time.Millisecond,
-		TenantID:      tenant1,
 	})
-	defer worker1.Stop()
 
-	worker2 := flows.NewWorker(pool, flows.WorkerConfig{
-		Concurrency:   2,
-		WorkflowNames: []string{"tenant-signal-workflow"},
-		PollInterval:  200 * time.Millisecond,
-		TenantID:      tenant2,
-	})
-	defer worker2.Stop()
+	workerCtx, cancel := context.WithCancel(ctx)
 
-	workerCtx1, cancel1 := context.WithCancel(ctx1)
-	defer cancel1()
-
-	workerCtx2, cancel2 := context.WithCancel(ctx2)
-	defer cancel2()
-
-	go func() {
-		if err := worker1.Run(workerCtx1); err != nil && err != context.Canceled {
-			t.Logf("Worker 1 error: %v", err)
-		}
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
 	}()
 
 	go func() {
-		if err := worker2.Run(workerCtx2); err != nil && err != context.Canceled {
-			t.Logf("Worker 2 error: %v", err)
+		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
+			t.Logf("Worker error: %v", err)
 		}
 	}()
 

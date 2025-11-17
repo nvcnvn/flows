@@ -153,7 +153,6 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 
 	// Create engine
 	engine := flows.NewEngine(pool)
-	flows.SetEngine(engine)
 
 	// Set tenant ID
 	tenantID := uuid.New()
@@ -161,8 +160,66 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 
 	t.Logf("Using tenant ID: %s", tenantID)
 
-	// Start workflow
-	exec, err := flows.Start(ctx, OrderWorkflow, &OrderInput{
+	// Create unique workflow for this test to avoid worker interference
+	testWorkflow := flows.New(
+		"order-workflow-complete-test",
+		1,
+		func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
+			input := ctx.Input()
+			orderUUID, err := ctx.UUIDv7()
+			if err != nil {
+				return nil, err
+			}
+			orderID := orderUUID.String()
+
+			fmt.Printf("Starting order workflow: order_id=%s, customer=%s\n", orderID, input.CustomerID)
+
+			payment, err := flows.ExecuteActivity(ctx, ChargePaymentActivity, &ChargePaymentInput{
+				CustomerID: input.CustomerID,
+				Amount:     input.TotalPrice,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("payment failed: %w", err)
+			}
+
+			if !payment.Success {
+				return nil, fmt.Errorf("payment was declined")
+			}
+
+			fmt.Printf("Payment successful: transaction_id=%s\n", payment.TransactionID)
+
+			fmt.Println("Waiting for warehouse confirmation...")
+			confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
+			if err != nil {
+				return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
+			}
+
+			if !confirmation.Available {
+				return nil, fmt.Errorf("items not available in warehouse")
+			}
+
+			fmt.Println("Warehouse confirmed items available")
+
+			shipment, err := flows.ExecuteActivity(ctx, ShipOrderActivity, &ShipOrderInput{
+				OrderID: orderID,
+				Items:   input.Items,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("shipping failed: %w", err)
+			}
+
+			fmt.Printf("Order shipped: tracking=%s\n", shipment.TrackingNumber)
+
+			return &OrderOutput{
+				OrderID:        orderID,
+				TrackingNumber: shipment.TrackingNumber,
+				Status:         "shipped",
+			}, nil
+		},
+	)
+
+	// Start workflow with explicit engine (avoid global state race)
+	exec, err := flows.StartWith(engine, ctx, testWorkflow, &OrderInput{
 		CustomerID: "cust-123",
 		Items:      []string{"item-1", "item-2"},
 		TotalPrice: 99.99,
@@ -175,14 +232,17 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 	// Start worker in background
 	worker := flows.NewWorker(pool, flows.WorkerConfig{
 		Concurrency:   5,
-		WorkflowNames: []string{"order-workflow"},
+		WorkflowNames: []string{"order-workflow-complete-test"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -193,16 +253,16 @@ func TestOrderWorkflow_Complete(t *testing.T) {
 	// Wait a bit for workflow to start processing
 	time.Sleep(2 * time.Second)
 
-	// Send warehouse confirmation signal
-	err = flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
+	// Send warehouse confirmation signal (use explicit engine)
+	err = flows.SendSignalWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
 		OrderID:   exec.WorkflowID().String(),
 		Available: true,
 	})
 	require.NoError(t, err, "Failed to send signal")
 	t.Log("Signal sent successfully")
 
-	// Query workflow status
-	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
+	// Query workflow status (use explicit engine)
+	status, err := flows.QueryWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err, "Failed to query workflow")
 	t.Logf("Workflow status: %+v", status)
 
@@ -243,42 +303,84 @@ func TestOrderWorkflow_WithTransaction(t *testing.T) {
 
 	// Create engine
 	engine := flows.NewEngine(pool)
-	flows.SetEngine(engine)
 
 	// Set tenant ID
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Begin transaction
-	tx, err := pool.Begin(ctx)
-	require.NoError(t, err, "Failed to begin transaction")
+	// Create unique workflow for this test to avoid worker interference
+	testWorkflow := flows.New(
+		"order-workflow-transaction-test",
+		1,
+		func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
+			input := ctx.Input()
+			orderUUID, err := ctx.UUIDv7()
+			if err != nil {
+				return nil, err
+			}
+			orderID := orderUUID.String()
 
-	// Start workflow atomically within transaction
-	exec, err := flows.Start(ctx, OrderWorkflow, &OrderInput{
-		CustomerID: "cust-456",
-		Items:      []string{"item-3"},
-		TotalPrice: 49.99,
-	}, flows.WithTx(tx))
-	require.NoError(t, err, "Failed to start workflow")
+			fmt.Printf("Starting order workflow: order_id=%s, customer=%s\n", orderID, input.CustomerID)
 
-	// Commit transaction
-	err = tx.Commit(ctx)
-	require.NoError(t, err, "Failed to commit transaction")
+			payment, err := flows.ExecuteActivity(ctx, ChargePaymentActivity, &ChargePaymentInput{
+				CustomerID: input.CustomerID,
+				Amount:     input.TotalPrice,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("payment failed: %w", err)
+			}
 
-	assert.NotEmpty(t, exec.WorkflowID(), "Workflow ID should not be empty")
-	t.Logf("Workflow started atomically: id=%s", exec.WorkflowID())
+			if !payment.Success {
+				return nil, fmt.Errorf("payment was declined")
+			}
 
-	// Start worker
+			fmt.Printf("Payment successful: transaction_id=%s\n", payment.TransactionID)
+
+			fmt.Println("Waiting for warehouse confirmation...")
+			confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
+			if err != nil {
+				return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
+			}
+
+			if !confirmation.Available {
+				return nil, fmt.Errorf("items not available in warehouse")
+			}
+
+			fmt.Println("Warehouse confirmed items available")
+
+			shipment, err := flows.ExecuteActivity(ctx, ShipOrderActivity, &ShipOrderInput{
+				OrderID: orderID,
+				Items:   input.Items,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("shipping failed: %w", err)
+			}
+
+			fmt.Printf("Order shipped: tracking=%s\n", shipment.TrackingNumber)
+
+			return &OrderOutput{
+				OrderID:        orderID,
+				TrackingNumber: shipment.TrackingNumber,
+				Status:         "shipped",
+			}, nil
+		},
+	)
+
+	// Start worker BEFORE beginning transaction to ensure it's ready
+	// This avoids race conditions where the worker might miss the workflow
 	worker := flows.NewWorker(pool, flows.WorkerConfig{
 		Concurrency:   5,
-		WorkflowNames: []string{"order-workflow"},
-		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
+		WorkflowNames: []string{"order-workflow-transaction-test"},
+		PollInterval:  100 * time.Millisecond, // Faster polling for test responsiveness
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -286,10 +388,50 @@ func TestOrderWorkflow_WithTransaction(t *testing.T) {
 		}
 	}()
 
-	// Wait and send signal
-	time.Sleep(2 * time.Second)
+	// Small delay to ensure worker is polling
+	time.Sleep(200 * time.Millisecond)
 
-	err = flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
+	// Begin transaction
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err, "Failed to begin transaction")
+
+	// Start workflow atomically within transaction (use explicit engine)
+	exec, err := flows.StartWith(engine, ctx, testWorkflow, &OrderInput{
+		CustomerID: "cust-456",
+		Items:      []string{"item-3"},
+		TotalPrice: 49.99,
+	}, flows.WithTx(tx))
+	require.NoError(t, err, "Failed to start workflow")
+
+	// Commit transaction - worker should pick it up immediately
+	err = tx.Commit(ctx)
+	require.NoError(t, err, "Failed to commit transaction")
+
+	assert.NotEmpty(t, exec.WorkflowID(), "Workflow ID should not be empty")
+	t.Logf("Workflow started atomically: id=%s", exec.WorkflowID())
+
+	// Wait for workflow to be picked up and reach the signal-waiting state
+	// Poll the workflow status until it's running (which means worker has processed it)
+	waitStart := time.Now()
+	workflowRunning := false
+	for time.Since(waitStart) < 10*time.Second {
+		status, err := flows.QueryWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID())
+		if err == nil && status.Status == flows.StatusRunning {
+			t.Logf("Workflow is running after %v", time.Since(waitStart))
+			workflowRunning = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if !workflowRunning {
+		t.Logf("Warning: Workflow may not be running yet after 10s")
+	}
+
+	// Additional delay to ensure workflow reaches the signal wait point
+	time.Sleep(1 * time.Second)
+
+	err = flows.SendSignalWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
 		OrderID:   exec.WorkflowID().String(),
 		Available: true,
 	})
@@ -329,14 +471,71 @@ func TestOrderWorkflow_SignalTimeout(t *testing.T) {
 
 	// Create engine
 	engine := flows.NewEngine(pool)
-	flows.SetEngine(engine)
 
 	// Set tenant ID
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	// Start workflow
-	exec, err := flows.Start(ctx, OrderWorkflow, &OrderInput{
+	// Create unique workflow for this test to avoid worker interference
+	testWorkflow := flows.New(
+		"order-workflow-timeout-test",
+		1,
+		func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
+			input := ctx.Input()
+			orderUUID, err := ctx.UUIDv7()
+			if err != nil {
+				return nil, err
+			}
+			orderID := orderUUID.String()
+
+			fmt.Printf("Starting order workflow: order_id=%s, customer=%s\n", orderID, input.CustomerID)
+
+			payment, err := flows.ExecuteActivity(ctx, ChargePaymentActivity, &ChargePaymentInput{
+				CustomerID: input.CustomerID,
+				Amount:     input.TotalPrice,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("payment failed: %w", err)
+			}
+
+			if !payment.Success {
+				return nil, fmt.Errorf("payment was declined")
+			}
+
+			fmt.Printf("Payment successful: transaction_id=%s\n", payment.TransactionID)
+
+			fmt.Println("Waiting for warehouse confirmation...")
+			confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
+			if err != nil {
+				return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
+			}
+
+			if !confirmation.Available {
+				return nil, fmt.Errorf("items not available in warehouse")
+			}
+
+			fmt.Println("Warehouse confirmed items available")
+
+			shipment, err := flows.ExecuteActivity(ctx, ShipOrderActivity, &ShipOrderInput{
+				OrderID: orderID,
+				Items:   input.Items,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("shipping failed: %w", err)
+			}
+
+			fmt.Printf("Order shipped: tracking=%s\n", shipment.TrackingNumber)
+
+			return &OrderOutput{
+				OrderID:        orderID,
+				TrackingNumber: shipment.TrackingNumber,
+				Status:         "shipped",
+			}, nil
+		},
+	)
+
+	// Start workflow (use explicit engine)
+	exec, err := flows.StartWith(engine, ctx, testWorkflow, &OrderInput{
 		CustomerID: "cust-789",
 		Items:      []string{"item-4"},
 		TotalPrice: 29.99,
@@ -346,14 +545,17 @@ func TestOrderWorkflow_SignalTimeout(t *testing.T) {
 	// Start worker
 	worker := flows.NewWorker(pool, flows.WorkerConfig{
 		Concurrency:   5,
-		WorkflowNames: []string{"order-workflow"},
+		WorkflowNames: []string{"order-workflow-timeout-test"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -364,8 +566,8 @@ func TestOrderWorkflow_SignalTimeout(t *testing.T) {
 	// Wait for workflow to start processing
 	time.Sleep(2 * time.Second)
 
-	// Query status - should be waiting for signal
-	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
+	// Query status - should be waiting for signal (use explicit engine)
+	status, err := flows.QueryWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err, "Failed to query workflow")
 	t.Logf("Workflow status (waiting for signal): %+v", status)
 
@@ -381,19 +583,76 @@ func TestOrderWorkflow_SignalBeforeWorker(t *testing.T) {
 	pool := SetupTestDB(t)
 
 	engine := flows.NewEngine(pool)
-	flows.SetEngine(engine)
 
 	tenantID := uuid.New()
 	ctx = flows.WithTenantID(ctx, tenantID)
 
-	exec, err := flows.Start(ctx, OrderWorkflow, &OrderInput{
+	// Create unique workflow for this test to avoid worker interference
+	testWorkflow := flows.New(
+		"order-workflow-presignal-test",
+		1,
+		func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
+			input := ctx.Input()
+			orderUUID, err := ctx.UUIDv7()
+			if err != nil {
+				return nil, err
+			}
+			orderID := orderUUID.String()
+
+			fmt.Printf("Starting order workflow: order_id=%s, customer=%s\n", orderID, input.CustomerID)
+
+			payment, err := flows.ExecuteActivity(ctx, ChargePaymentActivity, &ChargePaymentInput{
+				CustomerID: input.CustomerID,
+				Amount:     input.TotalPrice,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("payment failed: %w", err)
+			}
+
+			if !payment.Success {
+				return nil, fmt.Errorf("payment was declined")
+			}
+
+			fmt.Printf("Payment successful: transaction_id=%s\n", payment.TransactionID)
+
+			fmt.Println("Waiting for warehouse confirmation...")
+			confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
+			if err != nil {
+				return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
+			}
+
+			if !confirmation.Available {
+				return nil, fmt.Errorf("items not available in warehouse")
+			}
+
+			fmt.Println("Warehouse confirmed items available")
+
+			shipment, err := flows.ExecuteActivity(ctx, ShipOrderActivity, &ShipOrderInput{
+				OrderID: orderID,
+				Items:   input.Items,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("shipping failed: %w", err)
+			}
+
+			fmt.Printf("Order shipped: tracking=%s\n", shipment.TrackingNumber)
+
+			return &OrderOutput{
+				OrderID:        orderID,
+				TrackingNumber: shipment.TrackingNumber,
+				Status:         "shipped",
+			}, nil
+		},
+	)
+
+	exec, err := flows.StartWith(engine, ctx, testWorkflow, &OrderInput{
 		CustomerID: "cust-pre-signal",
 		Items:      []string{"item-a", "item-b"},
 		TotalPrice: 149.50,
 	})
 	require.NoError(t, err)
 
-	err = flows.SendSignal(ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
+	err = flows.SendSignalWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID(), "warehouse-ready", &WarehouseConfirmation{
 		OrderID:   exec.WorkflowID().String(),
 		Available: true,
 	})
@@ -401,20 +660,26 @@ func TestOrderWorkflow_SignalBeforeWorker(t *testing.T) {
 
 	worker := flows.NewWorker(pool, flows.WorkerConfig{
 		Concurrency:   5,
-		WorkflowNames: []string{"order-workflow"},
-		PollInterval:  200 * time.Millisecond,
-		TenantID:      tenantID,
+		WorkflowNames: []string{"order-workflow-presignal-test"},
+		PollInterval:  100 * time.Millisecond, // Faster polling for quicker pickup
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
 			t.Logf("Worker error: %v", err)
 		}
 	}()
+
+	// Give worker time to start polling before we expect results
+	time.Sleep(300 * time.Millisecond)
 
 	resultChan := make(chan struct {
 		result *OrderOutput
@@ -438,7 +703,7 @@ func TestOrderWorkflow_SignalBeforeWorker(t *testing.T) {
 		t.Fatal("workflow did not complete")
 	}
 
-	status, err := flows.Query(ctx, exec.WorkflowName(), exec.WorkflowID())
+	status, err := flows.QueryWith(engine, ctx, exec.WorkflowName(), exec.WorkflowID())
 	require.NoError(t, err)
 	assert.Equal(t, flows.StatusCompleted, status.Status)
 }

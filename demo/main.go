@@ -100,13 +100,13 @@ func main() {
 
 	// Start HTTP server
 	httpServer := &http.Server{
-		Addr:    ":8081",
+		Addr:    ":8181",
 		Handler: loggingMiddleware(mux),
 	}
 
 	// Graceful shutdown
 	go func() {
-		log.Println("🌐 Server starting on http://localhost:8081")
+		log.Println("🌐 Server starting on http://localhost:8181")
 		log.Printf("📊 Using %d shards for workflow distribution", sharder.NumShards())
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)

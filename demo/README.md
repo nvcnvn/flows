@@ -46,12 +46,12 @@ cd demo
 DATABASE_URL="postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable" go run .
 ```
 
-The API will start on `http://localhost:8081`
+The API will start on `http://localhost:8181`
 
 ### 3. Submit a Loan Application
 
 ```bash
-curl -X POST http://localhost:8081/api/loans \
+curl -X POST http://localhost:8181/api/loans \
   -H "Content-Type: application/json" \
   -d '{
     "applicant_name": "Jane Smith",
@@ -121,7 +121,7 @@ WHERE workflow_id = '018c123e-4567-7890-abcd-ef0123456789';
 
 ```bash
 # Use the base workflow name "loan-application" and workflow_id from previous response
-curl "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789"
+curl "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789"
 ```
 
 Response shows workflow is waiting for documents:
@@ -174,7 +174,7 @@ The workflow is now waiting for documents. For amounts > $50,000, it requires: i
 
 ```bash
 # Submit identity document
-curl -X POST "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/documents" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/documents" \
   -H "Content-Type: application/json" \
   -d '{
     "document_type": "identity",
@@ -182,7 +182,7 @@ curl -X POST "http://localhost:8081/api/loans/loan-application/018c123e-4567-789
   }'
 
 # Submit income document
-curl -X POST "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/documents" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/documents" \
   -H "Content-Type: application/json" \
   -d '{
     "document_type": "income",
@@ -190,7 +190,7 @@ curl -X POST "http://localhost:8081/api/loans/loan-application/018c123e-4567-789
   }'
 
 # Submit address document (required for amounts > $50k)
-curl -X POST "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/documents" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/documents" \
   -H "Content-Type: application/json" \
   -d '{
     "document_type": "address",
@@ -282,7 +282,7 @@ WHERE workflow_id = '018c123e-4567-7890-abcd-ef0123456789'
 If additional review is triggered (30% chance), send manager approval:
 
 ```bash
-curl -X POST "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/approve" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/approve" \
   -H "Content-Type: application/json" \
   -d '{
     "approver_role": "manager",
@@ -349,7 +349,7 @@ WHERE workflow_id = '018c123e-4567-7890-abcd-ef0123456789'
 ### 10. Get Final Result
 
 ```bash
-curl "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/result"
+curl "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789/result"
 ```
 
 Response:
@@ -445,7 +445,7 @@ Get workflow status using the base workflow name.
 
 **Example:**
 ```bash
-curl "http://localhost:8081/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789"
+curl "http://localhost:8181/api/loans/loan-application/018c123e-4567-7890-abcd-ef0123456789"
 ```
 
 **Response:**
@@ -465,7 +465,7 @@ Submit a document (sends signal).
 
 **Example:**
 ```bash
-curl -X POST "http://localhost:8081/api/loans/loan-application/018c.../documents" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/018c.../documents" \
   -H "Content-Type: application/json" \
   -d '{"document_type":"identity","document_id":"DL-123456789"}'
 ```
@@ -475,7 +475,7 @@ Submit manager approval (sends signal).
 
 **Example:**
 ```bash
-curl -X POST "http://localhost:8081/api/loans/loan-application/018c.../approve" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/018c.../approve" \
   -H "Content-Type: application/json" \
   -d '{"approver_role":"manager","approved":true,"comments":"Approved"}'
 ```
@@ -485,7 +485,7 @@ Get final workflow result.
 
 **Example:**
 ```bash
-curl "http://localhost:8081/api/loans/loan-application/018c.../result"
+curl "http://localhost:8181/api/loans/loan-application/018c.../result"
 ```
 
 ## Database Schema Deep Dive

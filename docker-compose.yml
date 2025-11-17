@@ -23,7 +23,7 @@ services:
     environment:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/flows_test?sslmode=disable"
     ports:
-      - "8081:8081"
+      - "8181:8181"
     depends_on:
       postgres:
         condition: service_healthy

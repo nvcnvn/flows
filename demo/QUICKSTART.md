@@ -99,7 +99,7 @@ ORDER BY sequence_num;
 
 ```bash
 # 1. Start application
-curl -X POST http://localhost:8081/api/loans \
+curl -X POST http://localhost:8181/api/loans \
   -H "Content-Type: application/json" \
   -d '{"applicant_name":"John Doe","amount":50000,"purpose":"business"}'
 
@@ -108,22 +108,22 @@ curl -X POST http://localhost:8081/api/loans \
 # The API automatically handles sharding internally
 
 # 2. Check status (use base workflow name in path)
-curl "http://localhost:8081/api/loans/loan-application/WORKFLOW_ID"
+curl "http://localhost:8181/api/loans/loan-application/WORKFLOW_ID"
 
 # 3. Submit documents
-curl -X POST "http://localhost:8081/api/loans/loan-application/WORKFLOW_ID/documents" \
+curl -X POST "http://localhost:8181/api/loans/loan-application/WORKFLOW_ID/documents" \
   -H "Content-Type: application/json" \
   -d '{"document_type":"identity","document_id":"DL-123"}'
 
 # 4. Get result
-curl "http://localhost:8081/api/loans/loan-application/WORKFLOW_ID/result"
+curl "http://localhost:8181/api/loans/loan-application/WORKFLOW_ID/result"
 ```
 
 ## Troubleshooting
 
 ### "connection refused"
 - Check if PostgreSQL is running: `docker ps`
-- Check if API is running: `curl http://localhost:8081/health`
+- Check if API is running: `curl http://localhost:8181/health`
 
 ### "workflow not found"
 - Make sure you're using the correct `workflow_name` (base name) from the start response

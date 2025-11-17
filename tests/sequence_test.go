@@ -125,12 +125,15 @@ func TestSequenceNumber_SingleActivity(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"single-activity-workflow"},
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		_ = worker.Run(workerCtx)
@@ -197,12 +200,15 @@ func TestSequenceNumber_MultipleActivities(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"multi-activity-workflow"},
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		_ = worker.Run(workerCtx)
@@ -300,12 +306,15 @@ func TestSequenceNumber_MixedOperations(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"mixed-operations-workflow"},
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		_ = worker.Run(workerCtx)
@@ -414,12 +423,15 @@ func TestSequenceNumber_ReplayConsistency(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"replay-consistency-workflow"},
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		_ = worker.Run(workerCtx)
@@ -509,12 +521,15 @@ func TestSequenceNumber_LoopOperations(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"loop-operations-workflow"},
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		_ = worker.Run(workerCtx)
@@ -642,12 +657,15 @@ func TestSequenceNumber_ConditionalBranching(t *testing.T) {
 				Concurrency:   2,
 				WorkflowNames: []string{"conditional-branch-workflow"},
 				PollInterval:  100 * time.Millisecond,
-				TenantID:      tenantID,
 			})
-			defer worker.Stop()
 
 			workerCtx, cancel := context.WithCancel(ctx)
-			defer cancel()
+
+			// Ensure proper cleanup order: cancel context first, then stop worker
+			defer func() {
+				cancel()
+				worker.Stop()
+			}()
 
 			go func() {
 				_ = worker.Run(workerCtx)

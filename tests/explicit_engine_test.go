@@ -57,12 +57,15 @@ func TestExplicitEngine_BasicWorkflow(t *testing.T) {
 		WorkflowNames: []string{"explicit-engine-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -116,12 +119,15 @@ func TestExplicitEngine_QueryAndGetResult(t *testing.T) {
 		WorkflowNames: []string{"query-workflow-explicit"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -186,12 +192,15 @@ func TestExplicitEngine_NoGlobalState(t *testing.T) {
 		WorkflowNames: []string{"no-global-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -242,13 +251,16 @@ func TestExplicitEngine_CustomShardConfig(t *testing.T) {
 		WorkflowNames: []string{"custom-shardconfig-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 		Sharder:       shardConfig, // Use same sharder
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -309,7 +321,6 @@ func TestExplicitEngine_MultipleEnginesWithDifferentShardConfigs(t *testing.T) {
 		WorkflowNames: []string{"multi-engine-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 		// Uses default global shard config (9 shards)
 	})
 	defer worker1.Stop()
@@ -319,7 +330,6 @@ func TestExplicitEngine_MultipleEnginesWithDifferentShardConfigs(t *testing.T) {
 		WorkflowNames: []string{"multi-engine-workflow"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 		Sharder:       shardConfig2,
 	})
 	defer worker2.Stop()

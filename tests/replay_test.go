@@ -265,12 +265,15 @@ func TestReplayWorkflow_ActivityRetry(t *testing.T) {
 		Concurrency:   5,
 		WorkflowNames: []string{"replay-test-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -388,7 +391,6 @@ func TestReplayWorkflow_ResumeAfterWorkerRestart(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"replay-test-workflow"},
 		PollInterval:  200 * time.Millisecond,
-		TenantID:      tenantID,
 	})
 
 	workerCtx1, cancel1 := context.WithCancel(ctx)
@@ -413,7 +415,6 @@ func TestReplayWorkflow_ResumeAfterWorkerRestart(t *testing.T) {
 		Concurrency:   2,
 		WorkflowNames: []string{"replay-test-workflow"},
 		PollInterval:  200 * time.Millisecond,
-		TenantID:      tenantID,
 	})
 	defer worker2.Stop()
 
@@ -486,12 +487,15 @@ func TestReplayWorkflow_ManualReplay(t *testing.T) {
 		Concurrency:   5,
 		WorkflowNames: []string{"replay-test-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		runErr := worker.Run(workerCtx)
@@ -626,12 +630,15 @@ func TestReplayWorkflow_MultipleFailures(t *testing.T) {
 		Concurrency:   5,
 		WorkflowNames: []string{"multi-fail-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		runErr := worker.Run(workerCtx)
@@ -764,7 +771,6 @@ func TestReplayWorkflow_LoopWithWorkerCrash(t *testing.T) {
 		Concurrency:       1,
 		WorkflowNames:     []string{"loop-with-crash-workflow"},
 		PollInterval:      100 * time.Millisecond,
-		TenantID:          tenantID,
 		VisibilityTimeout: 2 * time.Second, // Short timeout for testing
 	})
 
@@ -805,7 +811,6 @@ func TestReplayWorkflow_LoopWithWorkerCrash(t *testing.T) {
 		Concurrency:       1,
 		WorkflowNames:     []string{"loop-with-crash-workflow"},
 		PollInterval:      100 * time.Millisecond,
-		TenantID:          tenantID,
 		VisibilityTimeout: 2 * time.Second,
 	})
 	defer worker2.Stop()

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nvcnvn/flows/internal/registry"
 	"github.com/nvcnvn/flows/internal/storage"
@@ -87,7 +88,8 @@ func (eng *Engine) Store() *storage.Store {
 // The function fn receives the transaction to use for its operations.
 func executeInTx(ctx context.Context, store *storage.Store, tx Tx, fn func(Tx) error) error {
 	if tx != nil {
-		// Use provided transaction
+		// Use provided transaction but do NOT attempt to manage its lifecycle here.
+		// The caller is responsible for committing or rolling back.
 		return fn(tx)
 	}
 
@@ -96,9 +98,12 @@ func executeInTx(ctx context.Context, store *storage.Store, tx Tx, fn func(Tx) e
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	committed := false
 	defer func() {
-		rollbackErr := newTx.Rollback(ctx)
-		if err == nil {
+		if committed {
+			return
+		}
+		if rollbackErr := newTx.Rollback(ctx); rollbackErr != nil && rollbackErr != pgx.ErrTxClosed {
 			slog.Error("executeInTx Rollback error", "error", rollbackErr)
 		}
 	}()
@@ -107,7 +112,12 @@ func executeInTx(ctx context.Context, store *storage.Store, tx Tx, fn func(Tx) e
 		return err
 	}
 
-	return newTx.Commit(ctx)
+	if err := newTx.Commit(ctx); err != nil {
+		return err
+	}
+
+	committed = true
+	return nil
 }
 
 // startInternal is the internal implementation of Start.

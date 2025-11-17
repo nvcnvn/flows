@@ -42,7 +42,7 @@ type SubmitApprovalRequest struct {
 // POST /api/loans
 // Example:
 //
-//	curl -X POST http://localhost:8081/api/loans \
+//	curl -X POST http://localhost:8181/api/loans \
 //	  -H "Content-Type: application/json" \
 //	  -d '{"applicant_name":"John Doe","amount":75000,"purpose":"home renovation"}'
 func (s *Server) createLoanHandler(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +94,7 @@ func (s *Server) createLoanHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000"
+//	curl "http://localhost:8181/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000"
 func (s *Server) getLoanStatusHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract workflow name from path (base name, e.g., "loan-application")
 	workflowName := r.PathValue("workflowName")
@@ -132,7 +132,7 @@ func (s *Server) getLoanStatusHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl -X POST "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/documents" \
+//	curl -X POST "http://localhost:8181/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/documents" \
 //	  -H "Content-Type: application/json" \
 //	  -d '{"document_type":"identity","document_id":"DL-123456789"}'
 func (s *Server) submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +192,7 @@ func (s *Server) submitDocumentHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl -X POST "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/approve" \
+//	curl -X POST "http://localhost:8181/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/approve" \
 //	  -H "Content-Type: application/json" \
 //	  -d '{"approver_role":"manager","approved":true,"comments":"Looks good"}'
 func (s *Server) submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
@@ -248,7 +248,7 @@ func (s *Server) submitApprovalHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Example:
 //
-//	curl "http://localhost:8081/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/result"
+//	curl "http://localhost:8181/api/loans/loan-application/123e4567-e89b-12d3-a456-426614174000/result"
 func (s *Server) getLoanResultHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract workflow name from path (base name)
 	workflowName := r.PathValue("workflowName")

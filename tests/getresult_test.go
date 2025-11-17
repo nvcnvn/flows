@@ -73,12 +73,15 @@ func TestGetResult_WithoutExecution(t *testing.T) {
 		WorkflowNames: []string{"getresult-workflow"},
 		Concurrency:   2,
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -151,12 +154,15 @@ func TestWaitForResult(t *testing.T) {
 		WorkflowNames: []string{"waitresult-workflow"},
 		Concurrency:   2,
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -226,12 +232,15 @@ func TestQueryWithOutput(t *testing.T) {
 		WorkflowNames: []string{"query-workflow"},
 		Concurrency:   2,
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -300,12 +309,15 @@ func TestGetResult_Failed(t *testing.T) {
 		WorkflowNames: []string{"failing-getresult-workflow"},
 		Concurrency:   2,
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {

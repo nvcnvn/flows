@@ -50,12 +50,15 @@ func TestQueryWithTransaction(t *testing.T) {
 		WorkflowNames: []string{"query-tx-test"},
 		Concurrency:   1,
 		PollInterval:  100 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {

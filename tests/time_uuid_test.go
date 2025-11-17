@@ -217,12 +217,15 @@ func TestTimeTrackingWorkflow_Complete(t *testing.T) {
 		Concurrency:   5,
 		WorkflowNames: []string{"time-tracking-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -347,12 +350,15 @@ func TestTimeTrackingWorkflow_Rejection(t *testing.T) {
 		Concurrency:   5,
 		WorkflowNames: []string{"time-tracking-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
@@ -428,12 +434,15 @@ func TestTimeTrackingWorkflow_Determinism(t *testing.T) {
 		Concurrency:   5,
 		WorkflowNames: []string{"time-tracking-workflow"},
 		PollInterval:  500 * time.Millisecond,
-		TenantID:      tenantID,
 	})
-	defer worker.Stop()
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+
+	// Ensure proper cleanup order: cancel context first, then stop worker
+	defer func() {
+		cancel()
+		worker.Stop()
+	}()
 
 	go func() {
 		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {

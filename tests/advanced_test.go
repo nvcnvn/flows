@@ -3,6 +3,7 @@ package examples_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,14 +14,46 @@ import (
 	"github.com/nvcnvn/flows"
 )
 
-var failCount = atomic.NewInt32(0)
+type AdvancedRetryWorkflowInput struct {
+	TestID string
+}
+
+type AdvancedRetryActivityInput struct {
+	TestID string
+}
+
+var (
+	advancedRetryCounters   = make(map[string]*atomic.Int32)
+	advancedRetryCountersMu sync.Mutex
+)
+
+func getAdvancedRetryCounter(testID string) *atomic.Int32 {
+	advancedRetryCountersMu.Lock()
+	defer advancedRetryCountersMu.Unlock()
+
+	if counter, exists := advancedRetryCounters[testID]; exists {
+		return counter
+	}
+
+	counter := atomic.NewInt32(0)
+	advancedRetryCounters[testID] = counter
+	return counter
+}
+
+func resetAdvancedRetryCounter(testID string) {
+	advancedRetryCountersMu.Lock()
+	defer advancedRetryCountersMu.Unlock()
+
+	delete(advancedRetryCounters, testID)
+}
 
 var AdvancedTestFailThenSucceedActivity = flows.NewActivity(
 	"advanced-fail-then-succeed",
-	func(ctx context.Context, input *flows.NoInput) (*flows.NoOutput, error) {
+	func(ctx context.Context, input *AdvancedRetryActivityInput) (*flows.NoOutput, error) {
 		fmt.Println("executing advanced-fail-then-succeed activity")
-		failCount.Add(1)
-		if failCount.Load() <= 2 {
+		counter := getAdvancedRetryCounter(input.TestID)
+		attempt := counter.Add(1)
+		if attempt <= 2 {
 			return nil, flows.NewRetryableError(fmt.Errorf("transient failure"))
 		}
 		return &flows.NoOutput{}, nil
@@ -36,8 +69,9 @@ var AdvancedTestFailThenSucceedActivity = flows.NewActivity(
 var AdvancedTestRetryWorkflow = flows.New(
 	"advanced-retry-workflow",
 	1,
-	func(ctx *flows.Context[flows.NoInput]) (*flows.NoOutput, error) {
-		_, err := flows.ExecuteActivity(ctx, AdvancedTestFailThenSucceedActivity, &flows.NoInput{})
+	func(ctx *flows.Context[AdvancedRetryWorkflowInput]) (*flows.NoOutput, error) {
+		input := ctx.Input()
+		_, err := flows.ExecuteActivity(ctx, AdvancedTestFailThenSucceedActivity, &AdvancedRetryActivityInput{TestID: input.TestID})
 		if err != nil {
 			return nil, err
 		}
@@ -99,7 +133,6 @@ func TestAdvancedScenarios(t *testing.T) {
 	ctx = flows.WithTenantID(ctx, tenantID)
 
 	worker := flows.NewWorker(db, flows.WorkerConfig{
-		TenantID: tenantID,
 		WorkflowNames: []string{
 			"advanced-retry-workflow",
 			"advanced-loop-workflow",
@@ -114,12 +147,17 @@ func TestAdvancedScenarios(t *testing.T) {
 	defer worker.Stop()
 
 	t.Run("TestActivityRetry", func(t *testing.T) {
-		failCount.Store(0)
-		exec, err := flows.Start(ctx, AdvancedTestRetryWorkflow, &flows.NoInput{})
+		testID := uuid.New().String()
+		resetAdvancedRetryCounter(testID)
+		t.Cleanup(func() {
+			resetAdvancedRetryCounter(testID)
+		})
+
+		exec, err := flows.Start(ctx, AdvancedTestRetryWorkflow, &AdvancedRetryWorkflowInput{TestID: testID})
 		require.NoError(t, err)
 		_, err = exec.Get(ctx)
 		require.NoError(t, err)
-		require.Equal(t, int32(3), failCount.Load())
+		require.Equal(t, int32(3), getAdvancedRetryCounter(testID).Load())
 	})
 
 	t.Run("TestLoopWorkflow", func(t *testing.T) {

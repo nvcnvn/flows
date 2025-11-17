@@ -137,7 +137,6 @@ worker := flows.NewWorker(pool, flows.WorkerConfig{
 	Concurrency:   5,
 	WorkflowNames: []string{"order-workflow"},
 	PollInterval:  500 * time.Millisecond,
-	TenantID:      tenantID,
 })
 defer worker.Stop()
 ```

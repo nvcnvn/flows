@@ -31,7 +31,6 @@ type WorkerConfig struct {
 	WorkflowNames     []string      // Workflow types to handle
 	PollInterval      time.Duration // Poll frequency
 	VisibilityTimeout time.Duration // Task lock duration
-	TenantID          uuid.UUID     // Tenant to work for
 	Sharder           Sharder       // Optional custom sharder (uses global if nil)
 }
 
@@ -135,11 +134,8 @@ func (w *Worker) pollAndProcess(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// Add tenant ID to context
-	ctx = WithTenantID(ctx, w.config.TenantID)
-
-	// Dequeue task
-	task, err := w.store.DequeueTask(ctx, storage.UUIDToPgtype(w.config.TenantID), w.config.WorkflowNames, w.config.VisibilityTimeout)
+	// Dequeue task (works across all tenants)
+	task, err := w.store.DequeueTask(ctx, w.config.WorkflowNames, w.config.VisibilityTimeout)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -181,7 +177,7 @@ func (w *Worker) pollAndProcess(ctx context.Context) error {
 	}
 
 	// Task completed - remove from queue
-	if err := w.store.DeleteTask(ctx, task.WorkflowName, storage.UUIDToPgtype(w.config.TenantID), task.ID); err != nil {
+	if err := w.store.DeleteTask(ctx, task.WorkflowName, task.TenantID, task.ID); err != nil {
 		// Don't report error if context was cancelled
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -245,6 +241,16 @@ func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueu
 	}
 	if actModel == nil {
 		return fmt.Errorf("activity not found: %s", activityID)
+	}
+
+	status := ActivityStatus(actModel.Status)
+	if status == ActivityStatusCompleted || status == ActivityStatusFailed {
+		// Activity already reached a terminal state but its task was still in the queue (e.g. worker crash before ack).
+		// Ensure the workflow has a chance to resume/observe the latest result, then skip re-execution to maintain determinism.
+		if err := w.enqueueWorkflowTask(ctx, tenantID, workflowID, task.WorkflowName); err != nil {
+			return fmt.Errorf("failed to enqueue workflow task for resolved activity: %w", err)
+		}
+		return nil
 	}
 
 	// Get activity definition from registry (thread-safe)
@@ -581,7 +587,8 @@ func (w *Worker) failWorkflow(ctx context.Context, workflowName string, tenantID
 	if updateErr := w.store.UpdateWorkflowFailed(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), err.Error()); updateErr != nil {
 		return fmt.Errorf("failed to mark workflow as failed: %w", updateErr)
 	}
-	return err
+	// Workflow successfully marked as failed, return nil so task gets deleted from queue
+	return nil
 }
 
 // enqueueWorkflowTask creates a workflow task to resume execution.
