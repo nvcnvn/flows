@@ -36,81 +36,119 @@ Flows provides automatic handling of retry logic, exponential backoff, schedulin
 
 Activity functions must conform to the signature: `func(ctx context.Context, input *Input) (*Output, error)`.  
 Register activities using `flows.NewActivity` with a configured retry policy.
-```go
-var ChargePaymentActivity = flows.NewActivity(
-	"charge-payment",
-	func(ctx context.Context, input *ChargePaymentInput) (*ChargePaymentOutput, error) {
-		// real API calls here
-	},
-	flows.DefaultRetryPolicy,
-)
 
-var ShipOrderActivity = flows.NewActivity(
-	"ship-order",
-	func(ctx context.Context, input *ShipOrderInput) (*ShipOrderOutput, error) {
-		// real API calls here
-	},
-	flows.DefaultRetryPolicy,
-)
+**Dependency Injection**: Use factory functions with closures to inject dependencies (database pools, API clients, etc.):
+
+```go
+// Services holds shared dependencies
+type Services struct {
+    Pool        *pgxpool.Pool
+    PaymentAPI  *PaymentClient
+    ShippingAPI *ShippingClient
+}
+
+// NewActivities creates activities with injected dependencies via closures
+func NewActivities(svc *Services) *Activities {
+    return &Activities{
+        ChargePayment: flows.NewActivity(
+            "charge-payment",
+            func(ctx context.Context, input *ChargePaymentInput) (*ChargePaymentOutput, error) {
+                // Access injected dependencies through closure
+                result, err := svc.PaymentAPI.Charge(ctx, input.CustomerID, input.Amount)
+                if err != nil {
+                    return nil, err
+                }
+                return &ChargePaymentOutput{Success: result.Success}, nil
+            },
+            flows.DefaultRetryPolicy,
+        ),
+        
+        ShipOrder: flows.NewActivity(
+            "ship-order",
+            func(ctx context.Context, input *ShipOrderInput) (*ShipOrderOutput, error) {
+                tracking, err := svc.ShippingAPI.CreateShipment(ctx, input)
+                if err != nil {
+                    return nil, err
+                }
+                return &ShipOrderOutput{TrackingNumber: tracking}, nil
+            },
+            flows.DefaultRetryPolicy,
+        ),
+    }
+}
+
+type Activities struct {
+    ChargePayment *flows.Activity[ChargePaymentInput, ChargePaymentOutput]
+    ShipOrder     *flows.Activity[ShipOrderInput, ShipOrderOutput]
+}
 ```
+
+See [DEPENDENCY_INJECTION.md](DEPENDENCY_INJECTION.md) for detailed patterns and testing strategies.
 
 #### Workflow
 Workflows provide an imperative programming model for orchestrating complex business processes. Unlike traditional message queue architectures requiring separate handlers and scheduling mechanisms, workflows are expressed as standard Go functions.
 
 The framework ensures deterministic execution through replay. Each workflow step is executed exactly once per replay iteration, preventing duplicate side effects for activities during transient failures or system restarts.
 ```go
-var OrderWorkflow = flows.New(
-	"order-workflow",
-	1,
-	func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
-		input := ctx.Input()
-		orderUUID, err := ctx.UUIDv7()
-		if err != nil {
-			return nil, err
-		}
-		orderID := orderUUID.String()
+// NewWorkflows creates workflows with injected activities
+func NewWorkflows(activities *Activities) *Workflows {
+    return &Workflows{
+        OrderWorkflow: flows.New(
+            "order-workflow",
+            1,
+            func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
+                input := ctx.Input()
+                orderUUID, err := ctx.UUIDv7()
+                if err != nil {
+                    return nil, err
+                }
+                orderID := orderUUID.String()
 
-		// Step 1: Charge payment
-		payment, err := flows.ExecuteActivity(ctx, ChargePaymentActivity, &ChargePaymentInput{
-			CustomerID: input.CustomerID,
-			Amount:     input.TotalPrice,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("payment failed: %w", err)
-		}
+                // Step 1: Charge payment
+                payment, err := flows.ExecuteActivity(ctx, activities.ChargePayment, &ChargePaymentInput{
+                    CustomerID: input.CustomerID,
+                    Amount:     input.TotalPrice,
+                })
+                if err != nil {
+                    return nil, fmt.Errorf("payment failed: %w", err)
+                }
 
-		if !payment.Success {
-			return nil, fmt.Errorf("payment was declined")
-		}
+                if !payment.Success {
+                    return nil, fmt.Errorf("payment was declined")
+                }
 
+                // Step 2: Wait for warehouse confirmation
+                confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
+                if err != nil {
+                    return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
+                }
 
-		// Step 2: Wait for warehouse confirmation
-		confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
-		if err != nil {
-			return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
-		}
+                if !confirmation.Available {
+                    return nil, fmt.Errorf("items not available in warehouse")
+                }
 
-		if !confirmation.Available {
-			return nil, fmt.Errorf("items not available in warehouse")
-		}
+                // Step 3: Ship order
+                shipment, err := flows.ExecuteActivity(ctx, activities.ShipOrder, &ShipOrderInput{
+                    OrderID: orderID,
+                    Items:   input.Items,
+                })
+                if err != nil {
+                    return nil, fmt.Errorf("shipping failed: %w", err)
+                }
 
-		// Step 3: Ship order
-		shipment, err := flows.ExecuteActivity(ctx, ShipOrderActivity, &ShipOrderInput{
-			OrderID: orderID,
-			Items:   input.Items,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("shipping failed: %w", err)
-		}
+                return &OrderOutput{
+                    OrderID:        orderID,
+                    TrackingNumber: shipment.TrackingNumber,
+                    Status:         "shipped",
+                }, nil
+            },
+        ),
+    }
+}
 
-
-		return &OrderOutput{
-			OrderID:        orderID,
-			TrackingNumber: shipment.TrackingNumber,
-			Status:         "shipped",
-		}, nil
-	},
-)
+type Workflows struct {
+    OrderWorkflow *flows.Workflow[OrderInput, OrderOutput]
+}
 ```
 
 The framework provides deterministic helper functions:
@@ -127,22 +165,36 @@ The framework provides deterministic helper functions:
 Workers and engines can coexist in the same process or run separately. Both require a PostgreSQL connection pool:
 
 ```go
+// 1. Initialize dependencies
 pool, err := pgxpool.New(ctx, connString)
 if err != nil {
 	log.Fatalf("Failed to connect to database: %v", err)
 }
 defer pool.Close()
 
+services := &Services{
+    Pool:        pool,
+    PaymentAPI:  NewPaymentClient(),
+    ShippingAPI: NewShippingClient(),
+}
+
+// 2. Create activities and workflows with dependencies
+activities := NewActivities(services)
+workflows := NewWorkflows(activities)
+
+// 3. Start worker
 worker := flows.NewWorker(pool, flows.WorkerConfig{
 	Concurrency:   5,
 	WorkflowNames: []string{"order-workflow"},
 	PollInterval:  500 * time.Millisecond,
 })
 defer worker.Stop()
+go worker.Run(ctx)
 ```
 
 #### Engine Usage
 ```go
+// 4. Use engine to start workflows
 engine := flows.NewEngine(pool)
 
 // Tenant isolation: Extract from authentication context or use fixed value for single-tenant deployments
@@ -150,7 +202,7 @@ tenantID := extractTenantID(authToken)
 ctx = flows.WithTenantID(ctx, tenantID)
 
 // Start workflow asynchronously
-exec, err := flows.StartWith(engine, ctx, OrderWorkflow, &OrderInput{})
+exec, err := flows.StartWith(engine, ctx, workflows.OrderWorkflow, &OrderInput{})
 // REST API pattern: Return 201 Created with workflow_name and workflow_id for async processing
 // Synchronous pattern: Block and wait for completion
 result, err = flows.WaitForResultWith[OrderOutput](engine, ctx, exec.WorkflowName(), exec.WorkflowID())
