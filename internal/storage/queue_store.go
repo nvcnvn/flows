@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -11,12 +12,12 @@ import (
 
 // EnqueueTask adds a task to the task queue.
 func (s *Store) EnqueueTask(ctx context.Context, task *TaskQueueModel, tx interface{}) error {
-	query := `
-		INSERT INTO task_queue (
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
 			id, tenant_id, workflow_id, workflow_name, task_type, 
 			task_data, visibility_timeout
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
+	`, s.tableName("task_queue"))
 
 	var err error
 	if tx != nil {
@@ -61,16 +62,16 @@ func (s *Store) DequeueTask(ctx context.Context, workflowNames []string, visibil
 // This uses equality on workflow_name for Citus single-shard routing with FOR UPDATE.
 // Works across all tenants - returns the first available task regardless of tenant.
 func (s *Store) tryDequeueTaskForWorkflow(ctx context.Context, workflowName string, visibilityTimeout time.Duration) (*TaskQueueModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT id, tenant_id, workflow_id, workflow_name, task_type, 
 		       task_data, visibility_timeout
-		FROM task_queue
+		FROM %s
 		WHERE workflow_name = $1
 		  AND visibility_timeout < NOW()
 		ORDER BY id ASC
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`
+	`, s.tableName("task_queue"))
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -104,11 +105,11 @@ func (s *Store) tryDequeueTaskForWorkflow(ctx context.Context, workflowName stri
 	}
 
 	// Update visibility timeout
-	updateQuery := `
-		UPDATE task_queue 
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s 
 		SET visibility_timeout = $1
 		WHERE workflow_name = $2 AND id = $3
-	`
+	`, s.tableName("task_queue"))
 	newTimeout := time.Now().Add(visibilityTimeout)
 	_, err = tx.Exec(ctx, updateQuery, newTimeout, task.WorkflowName, task.ID)
 	if err != nil {
@@ -127,10 +128,10 @@ func (s *Store) tryDequeueTaskForWorkflow(ctx context.Context, workflowName stri
 // DeleteTask removes a task from the queue after successful processing.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) DeleteTask(ctx context.Context, workflowName string, tenantID, taskID pgtype.UUID) error {
-	query := `
-		DELETE FROM task_queue
+	query := fmt.Sprintf(`
+		DELETE FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND id = $3
-	`
+	`, s.tableName("task_queue"))
 
 	_, err := s.pool.Exec(ctx, query, workflowName, tenantID, taskID)
 	return err
@@ -138,11 +139,11 @@ func (s *Store) DeleteTask(ctx context.Context, workflowName string, tenantID, t
 
 // GetQueueDepth returns the number of pending tasks for a tenant.
 func (s *Store) GetQueueDepth(ctx context.Context, tenantID pgtype.UUID) (int, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM task_queue
+		FROM %s
 		WHERE tenant_id = $1 AND visibility_timeout < NOW()
-	`
+	`, s.tableName("task_queue"))
 
 	var count int
 	err := s.pool.QueryRow(ctx, query, tenantID).Scan(&count)

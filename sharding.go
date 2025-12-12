@@ -137,18 +137,11 @@ func SetShardConfig(config *ShardConfig) {
 // getGlobalSharder safely retrieves the global sharder.
 // If not set, returns a default configuration with 9 shards.
 func getGlobalSharder() Sharder {
-	globalSharderMu.RLock()
-	defer globalSharderMu.RUnlock()
+	globalSharderMu.Lock()
+	defer globalSharderMu.Unlock()
 
 	if globalSharder == nil {
-		// Return default shard config if not set
-		globalSharderMu.RUnlock()
-		globalSharderMu.Lock()
-		if globalSharder == nil {
-			globalSharder = NewDefaultShardConfig()
-		}
-		globalSharderMu.Unlock()
-		globalSharderMu.RLock()
+		globalSharder = NewDefaultShardConfig()
 	}
 
 	return globalSharder

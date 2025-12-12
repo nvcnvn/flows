@@ -51,6 +51,14 @@ func WithShardConfig(config *ShardConfig) EngineOption {
 	return WithSharder(config)
 }
 
+// WithSchemaName sets a custom schema name for the engine.
+// If not provided, the engine will use the default schema.
+func WithSchemaName(schema string) EngineOption {
+	return func(e *Engine) {
+		e.store = storage.NewStore(e.store.Pool(), schema)
+	}
+}
+
 // NewEngine creates a new workflow engine with PostgreSQL storage.
 // This is the main entry point for initializing the flows library.
 //
@@ -69,7 +77,7 @@ func WithShardConfig(config *ShardConfig) EngineOption {
 //	engine := flows.NewEngine(pool, flows.WithSharder(sharder))
 func NewEngine(pool *pgxpool.Pool, opts ...EngineOption) *Engine {
 	eng := &Engine{
-		store:   storage.NewStore(pool),
+		store:   storage.NewStore(pool, defaultSchema),
 		sharder: nil, // Will use global sharder if not set
 	}
 	for _, opt := range opts {

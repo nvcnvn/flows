@@ -15,6 +15,8 @@ import (
 	"github.com/nvcnvn/flows/internal/storage"
 )
 
+const defaultSchema = "flows"
+
 // Worker polls and executes workflow tasks.
 type Worker struct {
 	store   *storage.Store
@@ -32,6 +34,7 @@ type WorkerConfig struct {
 	PollInterval      time.Duration // Poll frequency
 	VisibilityTimeout time.Duration // Task lock duration
 	Sharder           Sharder       // Optional custom sharder (uses global if nil)
+	Schema            string        // Optional custom schema (uses "flows" if nil)
 }
 
 // NewWorker creates a new worker instance.
@@ -62,9 +65,12 @@ func NewWorker(pool *pgxpool.Pool, config WorkerConfig) *Worker {
 		expandedNames = append(expandedNames, shardedNames...)
 	}
 	config.WorkflowNames = expandedNames
+	if config.Schema == "" {
+		config.Schema = defaultSchema
+	}
 
 	return &Worker{
-		store:   storage.NewStore(pool),
+		store:   storage.NewStore(pool, config.Schema),
 		config:  config,
 		sharder: sharder,
 		stopCh:  make(chan struct{}),

@@ -9,19 +9,35 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// StoreConfig contains configuration for the Store.
+type StoreConfig struct {
+	Pool   *pgxpool.Pool
+	Schema string // Optional schema name (e.g., "myapp" → tables become "myapp.workflows")
+}
+
 // Store provides database operations for workflows.
 type Store struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	schema string
 }
 
 // NewStore creates a new storage instance.
-func NewStore(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+func NewStore(pool *pgxpool.Pool, schema string) *Store {
+	return &Store{pool: pool, schema: schema}
 }
 
 // Pool returns the underlying connection pool.
 func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
+}
+
+// tableName returns the schema-qualified table name.
+// If no schema is configured, returns the base table name.
+func (s *Store) tableName(base string) string {
+	if s.schema == "" {
+		return base
+	}
+	return s.schema + "." + base
 }
 
 // WorkflowModel represents a workflow in the database.

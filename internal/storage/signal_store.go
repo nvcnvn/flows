@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -9,11 +10,11 @@ import (
 
 // CreateSignal creates a new signal in the database.
 func (s *Store) CreateSignal(ctx context.Context, sig *SignalModel, tx interface{}) error {
-	query := `
-		INSERT INTO signals (
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
 			workflow_name, id, tenant_id, workflow_id, signal_name, payload, consumed
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
+	`, s.tableName("signals"))
 
 	var err error
 	if tx != nil {
@@ -36,13 +37,13 @@ func (s *Store) CreateSignal(ctx context.Context, sig *SignalModel, tx interface
 // GetSignal retrieves an unconsumed signal for a workflow.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) GetSignal(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID, signalName string) (*SignalModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT workflow_name, id, tenant_id, workflow_id, signal_name, payload, consumed
-		FROM signals
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND workflow_id = $3 AND signal_name = $4 AND NOT consumed
 		ORDER BY id ASC
 		LIMIT 1
-	`
+	`, s.tableName("signals"))
 
 	sig := &SignalModel{}
 	err := s.pool.QueryRow(ctx, query, workflowName, tenantID, workflowID, signalName).Scan(
@@ -63,11 +64,11 @@ func (s *Store) GetSignal(ctx context.Context, workflowName string, tenantID, wo
 // ConsumeSignal marks a signal as consumed.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) ConsumeSignal(ctx context.Context, workflowName string, tenantID, signalID pgtype.UUID) error {
-	query := `
-		UPDATE signals
+	query := fmt.Sprintf(`
+		UPDATE %s
 		SET consumed = true
 		WHERE workflow_name = $1 AND tenant_id = $2 AND id = $3
-	`
+	`, s.tableName("signals"))
 
 	_, err := s.pool.Exec(ctx, query, workflowName, tenantID, signalID)
 	return err
@@ -76,12 +77,12 @@ func (s *Store) ConsumeSignal(ctx context.Context, workflowName string, tenantID
 // GetSignalsByWorkflow retrieves all signals for a workflow.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) GetSignalsByWorkflow(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID) ([]*SignalModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT workflow_name, id, tenant_id, workflow_id, signal_name, payload, consumed
-		FROM signals
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND workflow_id = $3
 		ORDER BY id ASC
-	`
+	`, s.tableName("signals"))
 
 	rows, err := s.pool.Query(ctx, query, workflowName, tenantID, workflowID)
 	if err != nil {
@@ -107,11 +108,11 @@ func (s *Store) GetSignalsByWorkflow(ctx context.Context, workflowName string, t
 
 // CreateTimer creates a new timer in the database.
 func (s *Store) CreateTimer(ctx context.Context, timer *TimerModel, tx interface{}) error {
-	query := `
-		INSERT INTO timers (
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
 			workflow_name, id, tenant_id, workflow_id, sequence_num, fire_at, fired
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
+	`, s.tableName("timers"))
 
 	var err error
 	if tx != nil {
@@ -136,13 +137,13 @@ func (s *Store) CreateTimer(ctx context.Context, timer *TimerModel, tx interface
 // Note: This will only check timers from a single shard. To check across all shards,
 // call this function multiple times with different workflow names.
 func (s *Store) GetFiredTimers(ctx context.Context, workflowName string, tenantID pgtype.UUID, limit int) ([]*TimerModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT workflow_name, id, tenant_id, workflow_id, sequence_num, fire_at, fired
-		FROM timers
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND NOT fired AND fire_at <= NOW()
 		ORDER BY fire_at ASC
 		LIMIT $3
-	`
+	`, s.tableName("timers"))
 
 	rows, err := s.pool.Query(ctx, query, workflowName, tenantID, limit)
 	if err != nil {
@@ -169,11 +170,11 @@ func (s *Store) GetFiredTimers(ctx context.Context, workflowName string, tenantI
 // MarkTimerFired marks a timer as fired.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) MarkTimerFired(ctx context.Context, workflowName string, tenantID, timerID pgtype.UUID) error {
-	query := `
-		UPDATE timers
+	query := fmt.Sprintf(`
+		UPDATE %s
 		SET fired = true
 		WHERE workflow_name = $1 AND tenant_id = $2 AND id = $3
-	`
+	`, s.tableName("timers"))
 
 	_, err := s.pool.Exec(ctx, query, workflowName, tenantID, timerID)
 	return err
@@ -182,12 +183,12 @@ func (s *Store) MarkTimerFired(ctx context.Context, workflowName string, tenantI
 // GetTimersByWorkflow retrieves all timers for a workflow.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) GetTimersByWorkflow(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID) ([]*TimerModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT workflow_name, id, tenant_id, workflow_id, sequence_num, fire_at, fired
-		FROM timers
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND workflow_id = $3
 		ORDER BY sequence_num ASC
-	`
+	`, s.tableName("timers"))
 
 	rows, err := s.pool.Query(ctx, query, workflowName, tenantID, workflowID)
 	if err != nil {
@@ -213,11 +214,11 @@ func (s *Store) GetTimersByWorkflow(ctx context.Context, workflowName string, te
 
 // CreateHistoryEvent creates a history event.
 func (s *Store) CreateHistoryEvent(ctx context.Context, event *HistoryEventModel, tx interface{}) error {
-	query := `
-		INSERT INTO history_events (
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
 			workflow_name, id, tenant_id, workflow_id, sequence_num, event_type, event_data
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
+	`, s.tableName("history_events"))
 
 	var err error
 	if tx != nil {
@@ -240,12 +241,12 @@ func (s *Store) CreateHistoryEvent(ctx context.Context, event *HistoryEventModel
 // GetHistoryEvents retrieves history events for a workflow.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) GetHistoryEvents(ctx context.Context, workflowName string, tenantID, workflowID pgtype.UUID) ([]*HistoryEventModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT workflow_name, id, tenant_id, workflow_id, sequence_num, event_type, event_data
-		FROM history_events
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND workflow_id = $3
 		ORDER BY sequence_num ASC
-	`
+	`, s.tableName("history_events"))
 
 	rows, err := s.pool.Query(ctx, query, workflowName, tenantID, workflowID)
 	if err != nil {

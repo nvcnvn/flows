@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -9,12 +10,12 @@ import (
 
 // CreateDLQEntry adds a workflow to the dead letter queue.
 func (s *Store) CreateDLQEntry(ctx context.Context, dlq *DLQModel) error {
-	query := `
-		INSERT INTO dead_letter_queue (
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
 			id, tenant_id, workflow_id, workflow_name, workflow_version,
 			input, error, attempt, metadata, rerun_as_workflow_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`
+	`, s.tableName("dead_letter_queue"))
 
 	_, err := s.pool.Exec(ctx, query,
 		dlq.ID, dlq.TenantID, dlq.WorkflowID, dlq.WorkflowName,
@@ -28,12 +29,12 @@ func (s *Store) CreateDLQEntry(ctx context.Context, dlq *DLQModel) error {
 // GetDLQEntry retrieves a DLQ entry by ID.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) GetDLQEntry(ctx context.Context, workflowName string, tenantID, dlqID pgtype.UUID) (*DLQModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT id, tenant_id, workflow_id, workflow_name, workflow_version,
 		       input, error, attempt, metadata, rerun_as_workflow_id
-		FROM dead_letter_queue
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2 AND id = $3
-	`
+	`, s.tableName("dead_letter_queue"))
 
 	dlq := &DLQModel{}
 	err := s.pool.QueryRow(ctx, query, workflowName, tenantID, dlqID).Scan(
@@ -56,12 +57,12 @@ func (s *Store) GetDLQEntry(ctx context.Context, workflowName string, tenantID, 
 // This results in a broadcast query across all shards (less efficient).
 // Use GetDLQEntry() when workflow_name is known for better performance.
 func (s *Store) GetDLQEntryByID(ctx context.Context, tenantID, dlqID pgtype.UUID) (*DLQModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT id, tenant_id, workflow_id, workflow_name, workflow_version,
 		       input, error, attempt, metadata, rerun_as_workflow_id
-		FROM dead_letter_queue
+		FROM %s
 		WHERE tenant_id = $1 AND id = $2
-	`
+	`, s.tableName("dead_letter_queue"))
 
 	dlq := &DLQModel{}
 	err := s.pool.QueryRow(ctx, query, tenantID, dlqID).Scan(
@@ -85,14 +86,14 @@ func (s *Store) GetDLQEntryByID(ctx context.Context, tenantID, dlqID pgtype.UUID
 // Note: This will only list entries from a single shard. To list across all shards,
 // call this function multiple times with different workflow names.
 func (s *Store) ListDLQ(ctx context.Context, workflowName string, tenantID pgtype.UUID, limit int) ([]*DLQModel, error) {
-	query := `
+	query := fmt.Sprintf(`
 		SELECT id, tenant_id, workflow_id, workflow_name, workflow_version,
 		       input, error, attempt, metadata, rerun_as_workflow_id
-		FROM dead_letter_queue
+		FROM %s
 		WHERE workflow_name = $1 AND tenant_id = $2
 		ORDER BY id DESC
 		LIMIT $3
-	`
+	`, s.tableName("dead_letter_queue"))
 
 	rows, err := s.pool.Query(ctx, query, workflowName, tenantID, limit)
 	if err != nil {
@@ -120,11 +121,11 @@ func (s *Store) ListDLQ(ctx context.Context, workflowName string, tenantID pgtyp
 // UpdateDLQRerun marks a DLQ entry as rerun with new workflow ID.
 // workflow_name must be provided first for efficient shard routing in Citus.
 func (s *Store) UpdateDLQRerun(ctx context.Context, workflowName string, tenantID, dlqID, newWorkflowID pgtype.UUID) error {
-	query := `
-		UPDATE dead_letter_queue
+	query := fmt.Sprintf(`
+		UPDATE %s
 		SET rerun_as_workflow_id = $1
 		WHERE workflow_name = $2 AND tenant_id = $3 AND id = $4
-	`
+	`, s.tableName("dead_letter_queue"))
 
 	_, err := s.pool.Exec(ctx, query, newWorkflowID, workflowName, tenantID, dlqID)
 	return err
