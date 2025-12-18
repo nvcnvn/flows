@@ -2,674 +2,393 @@ package flows
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"math"
-	"math/rand"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/nvcnvn/flows/internal/registry"
-	"github.com/nvcnvn/flows/internal/storage"
 )
 
-const defaultSchema = "flows"
-
-// Worker polls and executes workflow tasks.
+// Worker polls Postgres for runnable workflow runs and executes them.
+//
+// A run is runnable when:
+// - status = 'queued', or
+// - status = 'sleeping' and next_wake_at <= now().
+//
+// Each registered workflow type runs in its own goroutine pool with configurable
+// concurrency. This ensures busy workflows don't block other workflow types.
+//
+// # Citus Compatibility
+//
+// The runs table is distributed by workflow_name_shard (the distribution column).
+// Citus requires SELECT ... FOR UPDATE SKIP LOCKED to be routed to a single shard,
+// which means the query must include an equality predicate on workflow_name_shard.
+//
+// Each workflow's shards are derived from: workflow_name + "_" + shard_index
+// (e.g., "my_workflow_0", "my_workflow_1", ...).
+//
+// The worker iterates through all shards for each workflow, using round-robin
+// rotation to prevent starvation when some shards have more work than others.
 type Worker struct {
-	store   *storage.Store
-	config  WorkerConfig
-	sharder Sharder
-	stopCh  chan struct{}
-	doneCh  chan struct{}
-	wg      sync.WaitGroup
+	Pool         *pgxpool.Pool
+	Registry     *Registry
+	Codec        Codec
+	PollInterval time.Duration
+	DBConfig     DBConfig
+
+	// DisableNotify disables LISTEN/NOTIFY wakeups. Polling remains enabled.
+	DisableNotify bool
+
+	// NotifyChannel overrides the Postgres channel name used for LISTEN/NOTIFY.
+	// If empty, a safe default is used.
+	NotifyChannel string
+
+	// GracefulShutdownTimeout is the maximum time to wait for in-progress runs
+	// to complete when the worker is shutting down. If zero, the worker will
+	// wait indefinitely for all in-progress work to complete.
+	GracefulShutdownTimeout time.Duration
 }
 
-// WorkerConfig configures worker behavior.
-type WorkerConfig struct {
-	Concurrency       int           // Number of concurrent task handlers
-	WorkflowNames     []string      // Workflow types to handle
-	PollInterval      time.Duration // Poll frequency
-	VisibilityTimeout time.Duration // Task lock duration
-	Sharder           Sharder       // Optional custom sharder (uses global if nil)
-	Schema            string        // Optional custom schema (uses "flows" if nil)
+// workflowState tracks per-workflow state for shard rotation.
+type workflowState struct {
+	shards  []string // all shard values for this workflow
+	shardRR uint64   // round-robin counter for shard rotation
 }
 
-// NewWorker creates a new worker instance.
-// Automatically expands base workflow names to include all shards.
-// Example: ["loan-workflow"] -> ["loan-workflow-shard-0", "loan-workflow-shard-1", ..., "loan-workflow-shard-8"]
-func NewWorker(pool *pgxpool.Pool, config WorkerConfig) *Worker {
-	// Set defaults
-	if config.Concurrency == 0 {
-		config.Concurrency = 10
+func (w *Worker) pollInterval() time.Duration {
+	if w.PollInterval <= 0 {
+		return 250 * time.Millisecond
 	}
-	if config.PollInterval == 0 {
-		config.PollInterval = 1 * time.Second
-	}
-	if config.VisibilityTimeout == 0 {
-		config.VisibilityTimeout = 5 * time.Minute
-	}
-
-	// Use provided sharder or global
-	sharder := config.Sharder
-	if sharder == nil {
-		sharder = getGlobalSharder()
-	}
-
-	// Expand workflow names to include all shards
-	var expandedNames []string
-	for _, baseName := range config.WorkflowNames {
-		shardedNames := getAllShardedWorkflowNames(baseName, sharder)
-		expandedNames = append(expandedNames, shardedNames...)
-	}
-	config.WorkflowNames = expandedNames
-	if config.Schema == "" {
-		config.Schema = defaultSchema
-	}
-
-	return &Worker{
-		store:   storage.NewStore(pool, config.Schema),
-		config:  config,
-		sharder: sharder,
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
-	}
+	return w.PollInterval
 }
 
-// Run starts the worker. Blocks until Stop is called or context is cancelled.
+func (w *Worker) notifyChannel() string {
+	return normalizeNotifyChannel(w.NotifyChannel)
+}
+
+// Run starts the worker and blocks until ctx is cancelled.
+// Each registered workflow type runs in its own goroutine pool based on its
+// configured concurrency. This ensures busy workflows don't block other types.
+//
+// Within each workflow's pool, workers iterate through all shards (workflow_name_shard values)
+// to find work. This is required for Citus compatibility where FOR UPDATE SKIP LOCKED
+// must be routed to a single shard.
 func (w *Worker) Run(ctx context.Context) error {
-	defer close(w.doneCh)
-
-	// Create a context that combines both stop signal and parent context
-	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Start worker goroutines
-	for i := 0; i < w.config.Concurrency; i++ {
-		w.wg.Add(1)
-		go w.workerLoop(workerCtx)
+	if w.Pool == nil {
+		return errors.New("flows: Worker.Pool is required")
+	}
+	if w.Registry == nil {
+		return errors.New("flows: Worker.Registry is required")
 	}
 
-	// Wait for stop signal or context cancellation
+	workflows := w.Registry.list()
+	if len(workflows) == 0 {
+		return errors.New("flows: no workflows registered")
+	}
+
+	shardCount := w.DBConfig.ShardCount
+	if shardCount <= 0 {
+		shardCount = 1
+	}
+
+	// Set up LISTEN/NOTIFY for low-latency wakeups
+	notifyCh := make(chan struct{}, 1)
+	if !w.DisableNotify {
+		go w.listenLoop(ctx, notifyCh)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+
+	// Start a goroutine pool for each workflow type
+	for _, runner := range workflows {
+		concurrency := runner.concurrency()
+		workflowName := runner.workflowName()
+
+		// Create shared state for this workflow's goroutines
+		state := &workflowState{
+			shards: ShardValuesForWorkflow(workflowName, shardCount),
+		}
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(name string, st *workflowState) {
+				defer wg.Done()
+				if err := w.runWorkflowLoop(ctx, name, st, notifyCh); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+				}
+			}(workflowName, state)
+		}
+	}
+
+	// Wait for context cancellation or error
 	select {
-	case <-w.stopCh:
-		cancel() // Cancel the worker context
 	case <-ctx.Done():
-		cancel()
+		// Graceful shutdown: wait for in-progress work to complete
+		if w.GracefulShutdownTimeout > 0 {
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// All workers finished gracefully
+			case <-time.After(w.GracefulShutdownTimeout):
+				// Timeout waiting for workers; they will be cancelled
+			}
+		} else {
+			// No timeout: wait indefinitely for all work to complete
+			wg.Wait()
+		}
+		return ctx.Err()
+	case err := <-errCh:
+		return err
 	}
-
-	// Wait for all worker goroutines to finish
-	w.wg.Wait()
-	return nil
 }
 
-// Stop gracefully stops the worker.
-func (w *Worker) Stop() {
-	close(w.stopCh)
-	<-w.doneCh
+// listenLoop maintains a LISTEN connection and signals notifyCh on notifications.
+func (w *Worker) listenLoop(ctx context.Context, notifyCh chan<- struct{}) {
+	for ctx.Err() == nil {
+		conn, err := w.Pool.Acquire(ctx)
+		if err != nil {
+			time.Sleep(w.pollInterval())
+			continue
+		}
+
+		ch := w.notifyChannel()
+		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+			conn.Release()
+			time.Sleep(w.pollInterval())
+			continue
+		}
+
+		pgxConn := conn.Conn()
+		for {
+			_, err := pgxConn.WaitForNotification(ctx)
+			if err != nil {
+				break
+			}
+			// Non-blocking send to wake up workers
+			select {
+			case notifyCh <- struct{}{}:
+			default:
+			}
+		}
+
+		conn.Release()
+		if ctx.Err() != nil {
+			return
+		}
+	}
 }
 
-// workerLoop polls for tasks and processes them.
-func (w *Worker) workerLoop(ctx context.Context) {
-	defer w.wg.Done()
-
-	ticker := time.NewTicker(w.config.PollInterval)
-	defer ticker.Stop()
-
+// runWorkflowLoop processes runs for a specific workflow type.
+// It iterates through all shards to find work, using round-robin rotation
+// to prevent starvation when some shards have more work.
+func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state *workflowState, notifyCh <-chan struct{}) error {
 	for {
+		processed, err := w.processOneForWorkflow(ctx, workflowName, state)
+		if err != nil {
+			return err
+		}
+		if processed {
+			continue
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Wait for notification or poll interval
 		select {
 		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := w.pollAndProcess(ctx); err != nil {
-				// Only log if it's not a context cancellation error
-				if err != context.Canceled && ctx.Err() == nil {
-					fmt.Printf("worker error: %v\n", err)
-				}
+			return ctx.Err()
+		case <-notifyCh:
+		case <-time.After(w.pollInterval()):
+		}
+	}
+}
+
+// processOneForWorkflow claims and executes one run for a specific workflow type.
+// It iterates through all shards for the workflow, starting from a rotating position
+// to ensure fair distribution of work across shards.
+//
+// On Citus, the query must include workflow_name_shard in the WHERE clause
+// so that FOR UPDATE SKIP LOCKED is routed to a single shard.
+func (w *Worker) processOneForWorkflow(ctx context.Context, workflowName string, state *workflowState) (processed bool, err error) {
+	shards := state.shards
+	if len(shards) == 0 {
+		return false, nil
+	}
+
+	// Single shard - no rotation needed
+	if len(shards) == 1 {
+		return w.processOneShard(ctx, workflowName, shards[0])
+	}
+
+	// Multiple shards - rotate starting position to prevent starvation
+	start := int(atomic.AddUint64(&state.shardRR, 1) % uint64(len(shards)))
+	for i := 0; i < len(shards); i++ {
+		shard := shards[(start+i)%len(shards)]
+		processed, err = w.processOneShard(ctx, workflowName, shard)
+		if err != nil || processed {
+			return processed, err
+		}
+	}
+	return false, nil
+}
+
+// processOneShard claims and executes one run from a specific shard.
+// The shard value (workflow_name_shard) is included in the WHERE clause
+// to ensure Citus routes the query to a single node.
+func (w *Worker) processOneShard(ctx context.Context, workflowName, shard string) (processed bool, err error) {
+	t := newDBTables(w.DBConfig)
+
+	tx, err := w.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var runID string
+	var inputJSON []byte
+
+	// Query with workflow_name_shard equality predicate for Citus compatibility.
+	// This ensures FOR UPDATE SKIP LOCKED is routed to a single shard.
+	query := fmt.Sprintf(`
+SELECT run_id, input_json
+FROM %s
+WHERE workflow_name_shard = $3
+  AND workflow_name = $4
+  AND (
+    status = $1
+    OR (status = $2 AND next_wake_at IS NOT NULL AND next_wake_at <= now())
+  )
+ORDER BY created_at
+FOR UPDATE SKIP LOCKED
+LIMIT 1
+`, t.runs)
+
+	err = tx.QueryRow(ctx, query, runStatusQueued, runStatusSleeping, shard, workflowName).
+		Scan(&runID, &inputJSON)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			_ = tx.Rollback(ctx)
+			return false, nil
+		}
+
+		// If the schema/tables haven't been created yet, don't crash the worker.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "3F000" || pgErr.Code == "42P01" {
+				_ = tx.Rollback(ctx)
+				return false, nil
 			}
 		}
-	}
-}
-
-// pollAndProcess polls for a task and processes it.
-func (w *Worker) pollAndProcess(ctx context.Context) error {
-	// Check if context is already cancelled before doing work
-	if ctx.Err() != nil {
-		return ctx.Err()
+		return false, err
 	}
 
-	// Dequeue task (works across all tenants)
-	task, err := w.store.DequeueTask(ctx, w.config.WorkflowNames, w.config.VisibilityTimeout)
+	_, err = tx.Exec(ctx, fmt.Sprintf(
+		"UPDATE %s SET status = $3, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2",
+		t.runs,
+	), shard, runID, runStatusRunning)
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to dequeue task: %w", err)
+		return false, err
 	}
 
-	if task == nil {
-		// No tasks available
-		return nil
-	}
-
-	// Check context again before processing
-	if ctx.Err() != nil {
-		// Context cancelled, return task to queue by not deleting it
-		return ctx.Err()
-	}
-
-	// Process task based on type
-	var processErr error
-	switch TaskType(task.TaskType) {
-	case TaskTypeWorkflow:
-		processErr = w.processWorkflowTask(ctx, task)
-	case TaskTypeActivity:
-		processErr = w.processActivityTask(ctx, task)
-	case TaskTypeTimer:
-		processErr = w.processTimerTask(ctx, task)
-	default:
-		processErr = fmt.Errorf("unknown task type: %s", task.TaskType)
-	}
-
-	if processErr != nil {
-		// Check if error is due to context cancellation
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		// Task failed - will be retried after visibility timeout
-		return fmt.Errorf("task processing failed: %w", processErr)
-	}
-
-	// Task completed - remove from queue
-	if err := w.store.DeleteTask(ctx, task.WorkflowName, task.TenantID, task.ID); err != nil {
-		// Don't report error if context was cancelled
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to delete task: %w", err)
-	}
-
-	return nil
-}
-
-// processWorkflowTask executes a workflow task.
-func (w *Worker) processWorkflowTask(ctx context.Context, task *storage.TaskQueueModel) error {
-	fmt.Printf("Processing workflow task: %s\n", storage.PgtypeToUUID(task.WorkflowID))
-
-	workflowID := storage.PgtypeToUUID(task.WorkflowID)
-	tenantID := storage.PgtypeToUUID(task.TenantID)
-
-	// Load workflow from database
-	wfModel, err := w.store.GetWorkflow(ctx, task.WorkflowName, task.TenantID, task.WorkflowID)
-	if err != nil {
-		return fmt.Errorf("failed to load workflow: %w", err)
-	}
-
-	// Extract base workflow name (remove shard suffix)
-	baseName := extractBaseWorkflowName(wfModel.Name)
-
-	// Get workflow definition from registry using base name (thread-safe)
-	workflowEntry, ok := globalWorkflowRegistry.get(baseName)
+	runner, ok := w.Registry.get(workflowName)
 	if !ok {
-		return fmt.Errorf("workflow %s not registered", baseName)
+		_, _ = tx.Exec(ctx, fmt.Sprintf(
+			"UPDATE %s SET status = $3, error_text = $4, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2",
+			t.runs,
+		), shard, runID, runStatusFailed, "workflow not registered: "+workflowName)
+		err = tx.Commit(ctx)
+		return true, err
 	}
 
-	// Execute workflow using type-erased execution
-	return w.executeWorkflow(ctx, wfModel.Name, workflowID, tenantID, wfModel, workflowEntry)
-}
+	wfCtx := newContext(RunKey{WorkflowNameShard: shard, RunID: RunID(runID)}, tx, runner.codec(), t)
 
-// processActivityTask executes an activity task.
-func (w *Worker) processActivityTask(ctx context.Context, task *storage.TaskQueueModel) error {
-	workflowID := storage.PgtypeToUUID(task.WorkflowID)
-	tenantID := storage.PgtypeToUUID(task.TenantID)
-
-	fmt.Printf("Processing activity task for workflow: %s\n", workflowID)
-
-	// Parse task data to get activity ID
-	var taskData struct {
-		ActivityID string `json:"activity_id"`
-	}
-	if err := json.Unmarshal(task.TaskData, &taskData); err != nil {
-		return fmt.Errorf("failed to parse task data: %w", err)
-	}
-
-	activityID, err := uuid.Parse(taskData.ActivityID)
-	if err != nil {
-		return fmt.Errorf("invalid activity ID: %w", err)
-	}
-
-	// Load activity from database
-	actModel, err := w.store.GetActivity(ctx, task.WorkflowName, task.TenantID, storage.UUIDToPgtype(activityID))
-	if err != nil {
-		return fmt.Errorf("failed to load activity: %w", err)
-	}
-	if actModel == nil {
-		return fmt.Errorf("activity not found: %s", activityID)
-	}
-
-	status := ActivityStatus(actModel.Status)
-	if status == ActivityStatusCompleted || status == ActivityStatusFailed {
-		// Activity already reached a terminal state but its task was still in the queue (e.g. worker crash before ack).
-		// Ensure the workflow has a chance to resume/observe the latest result, then skip re-execution to maintain determinism.
-		if err := w.enqueueWorkflowTask(ctx, tenantID, workflowID, task.WorkflowName); err != nil {
-			return fmt.Errorf("failed to enqueue workflow task for resolved activity: %w", err)
-		}
-		return nil
-	}
-
-	// Get activity definition from registry (thread-safe)
-	activityEntry, ok := globalActivityRegistry.get(actModel.Name)
-	if !ok {
-		return fmt.Errorf("activity %s not registered", actModel.Name)
-	}
-
-	// Update status to running
-	if err := w.store.UpdateActivityStatus(ctx, task.WorkflowName, task.TenantID, actModel.ID, string(ActivityStatusRunning)); err != nil {
-		return fmt.Errorf("failed to update activity status: %w", err)
-	}
-
-	// Execute activity
-	output, execErr := w.executeActivity(ctx, workflowID, tenantID, activityID, actModel, activityEntry)
-
-	if execErr != nil {
-		// Check if error is terminal
-		if IsTerminalError(execErr) {
-			// Terminal error - don't retry, mark as failed
-			actModel.Status = string(ActivityStatusFailed)
-			actModel.Error = execErr.Error()
-			if err := w.store.UpdateActivityFailed(ctx, actModel); err != nil {
-				return fmt.Errorf("failed to update activity as failed: %w", err)
-			}
-
-			// Enqueue workflow task to handle failure
-			if err := w.enqueueWorkflowTask(ctx, tenantID, workflowID, task.WorkflowName); err != nil {
-				return fmt.Errorf("failed to enqueue workflow task: %w", err)
-			}
-
-			return nil
-		}
-
-		// Retryable error - calculate backoff and schedule retry
-		actModel.Attempt++
-		actModel.Error = execErr.Error()
-
-		// Get retry policy from activity definition
-		retryPolicy := w.getActivityRetryPolicy(activityEntry)
-
-		// Check if max attempts exceeded
-		if actModel.Attempt >= retryPolicy.MaxAttempts {
-			actModel.Status = string(ActivityStatusFailed)
-			if err := w.store.UpdateActivityFailed(ctx, actModel); err != nil {
-				return fmt.Errorf("failed to update activity as failed: %w", err)
-			}
-
-			// Enqueue workflow task to handle failure
-			if err := w.enqueueWorkflowTask(ctx, tenantID, workflowID, task.WorkflowName); err != nil {
-				return fmt.Errorf("failed to enqueue workflow task: %w", err)
-			}
-
-			return nil
-		}
-
-		// Calculate next retry time
-		backoffDuration := w.calculateBackoff(retryPolicy, actModel.Attempt)
-		nextRetry := time.Now().Add(backoffDuration)
-		actModel.NextRetryAt = &nextRetry
-		actModel.BackoffMs = backoffDuration.Milliseconds()
-		actModel.Status = string(ActivityStatusScheduled)
-
-		if err := w.store.UpdateActivityFailed(ctx, actModel); err != nil {
-			return fmt.Errorf("failed to update activity for retry: %w", err)
-		}
-
-		// Re-enqueue activity task with new visibility timeout
-		retryTask := &storage.TaskQueueModel{
-			ID:                storage.UUIDToPgtype(uuid.New()),
-			TenantID:          task.TenantID,
-			WorkflowID:        task.WorkflowID,
-			WorkflowName:      task.WorkflowName,
-			TaskType:          string(TaskTypeActivity),
-			TaskData:          task.TaskData,
-			VisibilityTimeout: nextRetry,
-		}
-		if err := w.store.EnqueueTask(ctx, retryTask, nil); err != nil {
-			return fmt.Errorf("failed to enqueue retry task: %w", err)
-		}
-
-		return nil
-	}
-
-	// Activity succeeded - save output
-	if err := w.store.UpdateActivityComplete(ctx, task.WorkflowName, task.TenantID, actModel.ID, output); err != nil {
-		return fmt.Errorf("failed to update activity as completed: %w", err)
-	}
-
-	// Enqueue workflow task to resume execution
-	if err := w.enqueueWorkflowTask(ctx, tenantID, workflowID, task.WorkflowName); err != nil {
-		return fmt.Errorf("failed to enqueue workflow task: %w", err)
-	}
-
-	return nil
-}
-
-// processTimerTask handles a timer that has fired.
-func (w *Worker) processTimerTask(ctx context.Context, task *storage.TaskQueueModel) error {
-	workflowID := storage.PgtypeToUUID(task.WorkflowID)
-	tenantID := storage.PgtypeToUUID(task.TenantID)
-
-	fmt.Printf("Processing timer task for workflow: %s\n", workflowID)
-
-	// Parse task data to get timer ID
-	var taskData struct {
-		TimerID string `json:"timer_id"`
-	}
-	if err := json.Unmarshal(task.TaskData, &taskData); err != nil {
-		return fmt.Errorf("failed to parse task data: %w", err)
-	}
-
-	timerID, err := uuid.Parse(taskData.TimerID)
-	if err != nil {
-		return fmt.Errorf("invalid timer ID: %w", err)
-	}
-
-	// Mark timer as fired
-	if err := w.store.MarkTimerFired(ctx, task.WorkflowName, task.TenantID, storage.UUIDToPgtype(timerID)); err != nil {
-		return fmt.Errorf("failed to mark timer as fired: %w", err)
-	}
-
-	// Enqueue workflow task to resume execution
-	if err := w.enqueueWorkflowTask(ctx, tenantID, workflowID, task.WorkflowName); err != nil {
-		return fmt.Errorf("failed to enqueue workflow task: %w", err)
-	}
-
-	return nil
-}
-
-// executeWorkflow executes a workflow with the given definition.
-// This implements the full workflow execution with deterministic replay.
-func (w *Worker) executeWorkflow(
-	ctx context.Context,
-	workflowName string,
-	workflowID uuid.UUID,
-	tenantID uuid.UUID,
-	wfModel *storage.WorkflowModel,
-	workflowEntry *WorkflowRegistryEntry,
-) error {
-	// Update status to running
-	if err := w.store.UpdateWorkflowStatus(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), string(StatusRunning)); err != nil {
-		return fmt.Errorf("failed to update workflow status: %w", err)
-	}
-
-	// 1. Deserialize input using type info from registry
-	input, err := registry.Deserialize(workflowEntry.inputType.Name, wfModel.Input)
-	if err != nil {
-		return w.failWorkflow(ctx, workflowName, tenantID, workflowID, fmt.Errorf("failed to deserialize input: %w", err))
-	}
-
-	// 2. Load activity results for replay
-	activityResults := make(map[int]interface{})
-	activityErrors := make(map[int]error)
-	activities, err := w.store.GetActivitiesByWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
-	if err != nil {
-		return fmt.Errorf("failed to load activities: %w", err)
-	}
-
-	for _, act := range activities {
-		if act.Status == string(ActivityStatusCompleted) {
-			// Deserialize activity output (thread-safe)
-			actEntry, ok := globalActivityRegistry.get(act.Name)
-			if !ok {
-				continue // Skip unregistered activities
-			}
-
-			output, err := registry.Deserialize(actEntry.outputType.Name, act.Output)
-			if err == nil {
-				activityResults[act.SequenceNum] = output
-			}
-		} else if act.Status == string(ActivityStatusFailed) {
-			// Store activity failure for replay
-			activityErrors[act.SequenceNum] = fmt.Errorf("activity failed: %s", act.Error)
-		}
-	}
-
-	// Load timer results for replay
-	timerResults := make(map[int]time.Time)
-	timers, err := w.store.GetTimersByWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
-	if err != nil {
-		return fmt.Errorf("failed to load timers: %w", err)
-	}
-
-	for _, timer := range timers {
-		if timer.Fired {
-			// Store the fire time for fired timers so they skip on replay
-			timerResults[timer.SequenceNum] = timer.FireAt
-		}
-	}
-
-	// Load time results and random results for replay from history events
-	timeResults := make(map[int]time.Time)
-	randomResults := make(map[int][]byte)
-	historyEvents, err := w.store.GetHistoryEvents(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
-	if err != nil {
-		return fmt.Errorf("failed to load history events: %w", err)
-	}
-
-	for _, event := range historyEvents {
-		if event.EventType == string(EventTimeRecorded) {
-			// Parse the recorded time from event data
-			var eventData map[string]interface{}
-			if err := json.Unmarshal(event.EventData, &eventData); err == nil {
-				if timeStr, ok := eventData["recorded_time"].(string); ok {
-					if recordedTime, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-						timeResults[event.SequenceNum] = recordedTime
-					}
-				}
-			}
-		} else if event.EventType == string(EventRandomGenerated) {
-			// Parse the recorded random bytes from event data
-			var eventData map[string]interface{}
-			if err := json.Unmarshal(event.EventData, &eventData); err == nil {
-				if randomBytesIface, ok := eventData["random_bytes"]; ok {
-					// Random bytes are stored as []interface{} (JSON array of numbers)
-					if randomBytesSlice, ok := randomBytesIface.([]interface{}); ok {
-						randomBytes := make([]byte, len(randomBytesSlice))
-						for i, b := range randomBytesSlice {
-							if byteVal, ok := b.(float64); ok {
-								randomBytes[i] = byte(byteVal)
-							}
-						}
-						randomResults[event.SequenceNum] = randomBytes
-					}
-				}
-			}
-		}
-	}
-
-	// Load signal results for replay - store raw JSON, will be deserialized on demand
-	signalResults := make(map[string]interface{})
-	signals, err := w.store.GetSignalsByWorkflow(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID))
-	if err != nil {
-		return fmt.Errorf("failed to load signals: %w", err)
-	}
-
-	for _, sig := range signals {
-		if sig.Consumed {
-			// Store raw JSON payload for replay - will be deserialized to correct type in WaitForSignal
-			signalResults[sig.SignalName] = sig.Payload
-		}
-	}
-
-	// 3. Execute workflow with pause function
-	var pauseErr error
-	pauseFunc := func() error {
-		pauseErr = ErrWorkflowPaused
-		panic(ErrWorkflowPaused)
-	}
-
-	// 4. Execute workflow function with panic/recover
-	var output interface{}
-	var finalSequenceNum int
-	var execErr error
-
+	// Run the workflow, catching durable yields.
+	var outputJSON []byte
+	var runErr error
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				// Check if it's our expected pause
-				if err, ok := r.(error); ok && err == ErrWorkflowPaused {
-					// Workflow paused for activity/timer/signal - this is normal
-					// The activity/timer/signal has been scheduled
-					pauseErr = ErrWorkflowPaused
-				} else {
-					// Unexpected panic - mark workflow as failed
-					panicErr := fmt.Errorf("workflow panicked: %v", r)
-					if err := w.failWorkflow(ctx, workflowName, tenantID, workflowID, panicErr); err != nil {
-						fmt.Printf("Failed to mark workflow as failed: %v\n", err)
-					}
+				if y, ok := r.(yieldPanic); ok {
+					runErr = y
+					return
 				}
+				buf := make([]byte, 64*1024)
+				n := runtime.Stack(buf, false)
+				runErr = WorkflowPanicError{Value: r, Stack: string(buf[:n])}
 			}
 		}()
 
-		// Execute workflow directly using the type-erased execute function
-		// Returns: output, finalSequenceNum, error
-		execCtx := &workflowExecutionContext{
-			Ctx:             ctx,
-			WorkflowID:      workflowID,
-			TenantID:        tenantID,
-			Input:           input,
-			SequenceNum:     wfModel.SequenceNum,
-			WorkflowName:    wfModel.Name,
-			Store:           w.store,
-			PauseFunc:       pauseFunc,
-			ActivityResults: activityResults,
-			ActivityErrors:  activityErrors,
-			TimerResults:    timerResults,
-			TimeResults:     timeResults,
-			RandomResults:   randomResults,
-			SignalResults:   signalResults,
-		}
-		output, finalSequenceNum, execErr = workflowEntry.execute(execCtx)
+		outputJSON, runErr = runner.run(ctx, wfCtx, inputJSON)
 	}()
 
-	// Check if workflow was paused
-	if pauseErr == ErrWorkflowPaused {
-		// Workflow paused - save current sequence number
-		// The execute function returns the updated sequenceNum
-		currentSequenceNum := finalSequenceNum
-
-		// Serialize activity results to save
-		activityResultsJSON, err := json.Marshal(activityResults)
-		if err != nil {
-			return fmt.Errorf("failed to serialize activity results: %w", err)
+	if runErr != nil {
+		if _, ok := runErr.(yieldPanic); ok {
+			err = tx.Commit(ctx)
+			return true, err
 		}
 
-		if err := w.store.UpdateWorkflowSequence(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), currentSequenceNum, activityResultsJSON); err != nil {
-			return fmt.Errorf("failed to update workflow sequence: %w", err)
+		_, _ = tx.Exec(ctx,
+			fmt.Sprintf("UPDATE %s SET status = $3, error_text = $4, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2", t.runs),
+			shard, runID, runStatusFailed, runErr.Error(),
+		)
+		err = tx.Commit(ctx)
+		return true, err
+	}
+
+	_, err = tx.Exec(ctx, fmt.Sprintf(
+		"UPDATE %s SET status = $3, output_json = $4, error_text = NULL, next_wake_at = NULL, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2",
+		t.runs,
+	), shard, runID, runStatusCompleted, outputJSON)
+	if err != nil {
+		return false, fmt.Errorf("persist run output: %w", err)
+	}
+
+	err = tx.Commit(ctx)
+	if err != nil {
+		return false, fmt.Errorf("commit workflow run %s: %w", runID, err)
+	}
+	return true, nil
+}
+
+// ProcessOne claims and executes at most one runnable run from any registered workflow.
+// Returns processed=false if no runnable runs exist.
+// This is useful for testing or when fine-grained control over processing is needed.
+func (w *Worker) ProcessOne(ctx context.Context) (processed bool, err error) {
+	shardCount := w.DBConfig.ShardCount
+	if shardCount <= 0 {
+		shardCount = 1
+	}
+
+	workflows := w.Registry.list()
+	for _, runner := range workflows {
+		workflowName := runner.workflowName()
+		shards := ShardValuesForWorkflow(workflowName, shardCount)
+		for _, shard := range shards {
+			processed, err = w.processOneShard(ctx, workflowName, shard)
+			if err != nil || processed {
+				return processed, err
+			}
 		}
-		return nil
 	}
-
-	// 5. Workflow completed - check for error
-	if execErr != nil {
-		return w.failWorkflow(ctx, workflowName, tenantID, workflowID, execErr)
-	}
-
-	// 6. Serialize and save output
-	outputData, err := json.Marshal(output)
-	if err != nil {
-		return w.failWorkflow(ctx, workflowName, tenantID, workflowID, fmt.Errorf("failed to serialize output: %w", err))
-	}
-
-	if err := w.store.UpdateWorkflowComplete(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), outputData); err != nil {
-		return fmt.Errorf("failed to update workflow as completed: %w", err)
-	}
-
-	return nil
-}
-
-// failWorkflow marks a workflow as failed.
-func (w *Worker) failWorkflow(ctx context.Context, workflowName string, tenantID, workflowID uuid.UUID, err error) error {
-	if updateErr := w.store.UpdateWorkflowFailed(ctx, workflowName, storage.UUIDToPgtype(tenantID), storage.UUIDToPgtype(workflowID), err.Error()); updateErr != nil {
-		return fmt.Errorf("failed to mark workflow as failed: %w", updateErr)
-	}
-	// Workflow successfully marked as failed, return nil so task gets deleted from queue
-	return nil
-}
-
-// enqueueWorkflowTask creates a workflow task to resume execution.
-func (w *Worker) enqueueWorkflowTask(ctx context.Context, tenantID, workflowID uuid.UUID, workflowName string) error {
-	taskID := uuid.New()
-	task := &storage.TaskQueueModel{
-		ID:                storage.UUIDToPgtype(taskID),
-		TenantID:          storage.UUIDToPgtype(tenantID),
-		WorkflowID:        storage.UUIDToPgtype(workflowID),
-		WorkflowName:      workflowName,
-		TaskType:          string(TaskTypeWorkflow),
-		VisibilityTimeout: time.Now(),
-	}
-	return w.store.EnqueueTask(ctx, task, nil)
-}
-
-// executeActivity executes an activity using reflection to call the Execute method.
-func (w *Worker) executeActivity(
-	ctx context.Context,
-	workflowID uuid.UUID,
-	tenantID uuid.UUID,
-	activityID uuid.UUID,
-	actModel *storage.ActivityModel,
-	activityEntry *ActivityRegistryEntry,
-) (json.RawMessage, error) {
-	// Deserialize input using type info from registry
-	input, err := registry.Deserialize(activityEntry.inputType.Name, actModel.Input)
-	if err != nil {
-		return nil, NewTerminalError(fmt.Errorf("failed to deserialize input: %w", err))
-	}
-
-	// Create activity context
-	activityCtx := NewActivityContext(ctx, workflowID, activityID, tenantID, actModel.Attempt)
-
-	// Execute activity directly using the type-erased execute function
-	output, err := activityEntry.execute(activityCtx.ctx, input)
-	if err != nil {
-		return nil, err
-	}
-
-	// Serialize output
-	outputData, err := json.Marshal(output)
-	if err != nil {
-		return nil, NewTerminalError(fmt.Errorf("failed to serialize output: %w", err))
-	}
-
-	return outputData, nil
-}
-
-// getActivityRetryPolicy extracts retry policy from activity definition.
-func (w *Worker) getActivityRetryPolicy(activityEntry *ActivityRegistryEntry) RetryPolicy {
-	return activityEntry.retryPolicy
-}
-
-// calculateBackoff calculates the backoff duration for retry.
-func (w *Worker) calculateBackoff(policy RetryPolicy, attempt int) time.Duration {
-	// Exponential backoff: initialInterval * (backoffFactor ^ (attempt - 1))
-	backoff := float64(policy.InitialInterval) * math.Pow(policy.BackoffFactor, float64(attempt-1))
-
-	// Cap at max interval
-	if backoff > float64(policy.MaxInterval) {
-		backoff = float64(policy.MaxInterval)
-	}
-
-	// Add jitter: ±jitter%
-	if policy.Jitter > 0 {
-		jitterAmount := backoff * policy.Jitter
-		jitter := (rand.Float64()*2 - 1) * jitterAmount // Random value between -jitterAmount and +jitterAmount
-		backoff += jitter
-	}
-
-	// Ensure positive
-	if backoff < 0 {
-		backoff = float64(policy.InitialInterval)
-	}
-
-	return time.Duration(backoff)
+	return false, nil
 }

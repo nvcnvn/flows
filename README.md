@@ -1,226 +1,147 @@
-# Flows - Simple Durable Workflow Orchestration for Go
 
-[![Go Version](https://img.shields.io/badge/go-1.25+-blue.svg)](https://golang.org/dl/)
-[![PostgreSQL](https://img.shields.io/badge/postgresql-18+-blue.svg)](https://www.postgresql.org/)
-[![Status](https://img.shields.io/badge/status-implementation-yellow.svg)](https://github.com/nvcnvn/flows)
+# flows
 
-> A lightweight, type-safe workflow orchestration library for Go, inspired by Temporal but designed to be "far more simple"
+Minimal, Postgres-backed durable workflow runner (Cadence/Temporal-style replay) in Go.
 
-## 🎯 Key Features
+## Guarantees
 
-- **Transaction Support**: Atomic workflow starts, signals, queries with application state using `WithTx()`
-- **Type-Safe Generics**: Compile-time type checking for workflows and activities
-- **Deterministic Replay**: Fault-tolerant execution with automatic state recovery
-- **PostgreSQL Native**: Leverages PostgreSQL 18's UUIDv7 and JSONB features
-- **Multi-Tenant Isolation**: Built-in tenant isolation at the database level
-- **Single Package API**: Clean, discoverable API with one import
-- **Simple**: Library-based, no separate cluster or infrastructure
+- **Type-safe**: steps and events use Go generics; no user casting.
+- **ACID-friendly**: the worker executes workflow code inside a `pgx.Tx`, so you can couple step outputs + business writes atomically.
+- **Replay-based durability**: on resume, the worker re-runs the workflow function; completed steps/events/timers are memoized in Postgres and returned without re-executing.
 
-## 🚀 Quick Start
+## Important note about Go generics
 
-### Installation
+Go currently does **not** support type parameters on methods, so the type-safe APIs are **package-level generic functions** like `flows.Execute(...)` and `flows.WaitForEvent[T](...)`.
 
-```bash
-go get github.com/nvcnvn/flows
-```
-Apply our schema in [[migrations](migrations)]
-- [migrations/001_init.sql](migrations/001_init.sql): base schema for any postgres
-- [migrations/002_citus.sql](migrations/002_citus.sql): optional - if you're use citus for sharding
+## Schema
 
-### Define Workflows and Activities
+Create the required tables:
 
-#### Activity
-Activities represent non-deterministic operations that interact with external systems. These operations are inherently fallible due to transient failures such as network timeouts, service unavailability, or rate limiting.  
+- Use the SQL in `flows.SchemaSQL` (see [schema.go](schema.go)).
+- By default, Flows uses the `flows` schema with unprefixed table names (`runs`, `steps`, ...).
+- To install into a different schema, use `flows.SchemaSQLFor("my_schema")`.
 
-Flows provides automatic handling of retry logic, exponential backoff, scheduling, and idempotency guarantees for activity executions.
-
-Activity functions must conform to the signature: `func(ctx context.Context, input *Input) (*Output, error)`.  
-Register activities using `flows.NewActivity` with a configured retry policy.
-
-**Dependency Injection**: Use factory functions with closures to inject dependencies (database pools, API clients, etc.):
+To point the worker/client at a custom schema:
 
 ```go
-// Services holds shared dependencies
-type Services struct {
-    Pool        *pgxpool.Pool
-    PaymentAPI  *PaymentClient
-    ShippingAPI *ShippingClient
-}
+cfg := flows.DBConfig{Schema: "my_schema"}
 
-// NewActivities creates activities with injected dependencies via closures
-func NewActivities(svc *Services) *Activities {
-    return &Activities{
-        ChargePayment: flows.NewActivity(
-            "charge-payment",
-            func(ctx context.Context, input *ChargePaymentInput) (*ChargePaymentOutput, error) {
-                // Access injected dependencies through closure
-                result, err := svc.PaymentAPI.Charge(ctx, input.CustomerID, input.Amount)
-                if err != nil {
-                    return nil, err
-                }
-                return &ChargePaymentOutput{Success: result.Success}, nil
-            },
-            flows.DefaultRetryPolicy,
-        ),
-        
-        ShipOrder: flows.NewActivity(
-            "ship-order",
-            func(ctx context.Context, input *ShipOrderInput) (*ShipOrderOutput, error) {
-                tracking, err := svc.ShippingAPI.CreateShipment(ctx, input)
-                if err != nil {
-                    return nil, err
-                }
-                return &ShipOrderOutput{TrackingNumber: tracking}, nil
-            },
-            flows.DefaultRetryPolicy,
-        ),
-    }
-}
+client := flows.Client{DBConfig: cfg}
+worker := flows.Worker{Pool: pool, Registry: reg, DBConfig: cfg}
+```
 
-type Activities struct {
-    ChargePayment *flows.Activity[ChargePaymentInput, ChargePaymentOutput]
-    ShipOrder     *flows.Activity[ShipOrderInput, ShipOrderOutput]
+## Sharding (Citus)
+
+Flows supports sharded Postgres setups (e.g. Citus) by routing all reads/writes using a
+distribution column `workflow_name_shard`.
+
+- Configure shard fan-out via `flows.DBConfig{ShardCount: N}`.
+- Each run is assigned to a shard deterministically as `workflow_name_<k>` where $0 \le k < N$.
+- The primary key for a run is `(workflow_name_shard, run_id)`; all child tables include the same shard key.
+
+Because of this, run identifiers are represented as `flows.RunKey`:
+
+```go
+type RunKey struct {
+	WorkflowNameShard string
+	RunID             flows.RunID
 }
 ```
 
-See [DEPENDENCY_INJECTION.md](DEPENDENCY_INJECTION.md) for detailed patterns and testing strategies.
+### Worker concurrency
 
-#### Workflow
-Workflows provide an imperative programming model for orchestrating complex business processes. Unlike traditional message queue architectures requiring separate handlers and scheduling mechanisms, workflows are expressed as standard Go functions.
+Each workflow type runs in its own goroutine pool with configurable concurrency.
+This ensures busy workflows don't block other workflow types.
 
-The framework ensures deterministic execution through replay. Each workflow step is executed exactly once per replay iteration, preventing duplicate side effects for activities during transient failures or system restarts.
 ```go
-// NewWorkflows creates workflows with injected activities
-func NewWorkflows(activities *Activities) *Workflows {
-    return &Workflows{
-        OrderWorkflow: flows.New(
-            "order-workflow",
-            1,
-            func(ctx *flows.Context[OrderInput]) (*OrderOutput, error) {
-                input := ctx.Input()
-                orderUUID, err := ctx.UUIDv7()
-                if err != nil {
-                    return nil, err
-                }
-                orderID := orderUUID.String()
+reg := flows.NewRegistry()
+flows.Register(reg, myFastWorkflow)  // default concurrency: 1
+flows.Register(reg, mySlowWorkflow, flows.WithConcurrency(10))  // 10 goroutines
 
-                // Step 1: Charge payment
-                payment, err := flows.ExecuteActivity(ctx, activities.ChargePayment, &ChargePaymentInput{
-                    CustomerID: input.CustomerID,
-                    Amount:     input.TotalPrice,
-                })
-                if err != nil {
-                    return nil, fmt.Errorf("payment failed: %w", err)
-                }
-
-                if !payment.Success {
-                    return nil, fmt.Errorf("payment was declined")
-                }
-
-                // Step 2: Wait for warehouse confirmation
-                confirmation, err := flows.WaitForSignal[OrderInput, WarehouseConfirmation](ctx, "warehouse-ready")
-                if err != nil {
-                    return nil, fmt.Errorf("warehouse confirmation failed: %w", err)
-                }
-
-                if !confirmation.Available {
-                    return nil, fmt.Errorf("items not available in warehouse")
-                }
-
-                // Step 3: Ship order
-                shipment, err := flows.ExecuteActivity(ctx, activities.ShipOrder, &ShipOrderInput{
-                    OrderID: orderID,
-                    Items:   input.Items,
-                })
-                if err != nil {
-                    return nil, fmt.Errorf("shipping failed: %w", err)
-                }
-
-                return &OrderOutput{
-                    OrderID:        orderID,
-                    TrackingNumber: shipment.TrackingNumber,
-                    Status:         "shipped",
-                }, nil
-            },
-        ),
-    }
-}
-
-type Workflows struct {
-    OrderWorkflow *flows.Workflow[OrderInput, OrderOutput]
-}
+worker := flows.Worker{Pool: pool, Registry: reg, DBConfig: flows.DBConfig{ShardCount: 32}}
+worker.Run(ctx)  // starts goroutine pools for each workflow type
 ```
 
-The framework provides deterministic helper functions:
-- **Sleep**: Suspends workflow execution until a specified time, enabling durable timer-based scheduling
-- **Random, UUIDv7, Time**: Deterministic generators that produce consistent results during replay
+### Citus Compatibility
 
-**Critical**: Use these helpers exclusively to maintain workflow determinism. Workflows must behave as pure functions with reproducible execution paths, enabling safe replay after timer expiration or process failure recovery.
+On Citus, `SELECT ... FOR UPDATE SKIP LOCKED` must be routed to a single shard. The worker
+achieves this by including `workflow_name_shard` (the distribution column) in the WHERE clause.
 
-### Worker and Engine
+The worker iterates through all shards for each workflow, using round-robin rotation to
+prevent starvation when some shards have more work than others. This happens automatically
+based on `DBConfig.ShardCount`.
 
-**Worker**: A long-running process that polls and executes workflow tasks from the PostgreSQL queue.  
-**Engine**: The client interface for starting workflows, sending signals, and querying execution state. This can be integrated into REST APIs, CLI tools, or any application component.
+## Example
 
-Workers and engines can coexist in the same process or run separately. Both require a PostgreSQL connection pool:
+See [examples/simple/example.go](examples/simple/example.go).
+
+At a high level:
+
+- API-side enqueue inside a transaction:
 
 ```go
-// 1. Initialize dependencies
-pool, err := pgxpool.New(ctx, connString)
-if err != nil {
-	log.Fatalf("Failed to connect to database: %v", err)
-}
-defer pool.Close()
+runKey, err := flows.BeginTx(ctx, flows.Client{DBConfig: flows.DBConfig{ShardCount: 10}}, tx, myWorkflow, &MyInput{...})
+```
 
-services := &Services{
-    Pool:        pool,
-    PaymentAPI:  NewPaymentClient(),
-    ShippingAPI: NewShippingClient(),
-}
+- Worker side:
 
-// 2. Create activities and workflows with dependencies
-activities := NewActivities(services)
-workflows := NewWorkflows(activities)
+```go
+reg := flows.NewRegistry()
+flows.Register(reg, myWorkflow)
 
-// 3. Start worker
-worker := flows.NewWorker(pool, flows.WorkerConfig{
-	Concurrency:   5,
-	WorkflowNames: []string{"order-workflow"},
-	PollInterval:  500 * time.Millisecond,
+worker := flows.Worker{Pool: pool, Registry: reg}
+_ = worker.Run(ctx)
+```
+
+- Workflow code uses durable primitives:
+
+```go
+out, err := flows.Execute(ctx, wf, "step/v1", stepFn, in, flows.RetryPolicy{MaxRetries: 3})
+flows.Sleep(ctx, wf, "sleep/v1", 5*time.Second)
+n := flows.WaitForEvent[int](ctx, wf, "customer_number/v1", "CustomerNumberEvent")
+uuid := flows.RandomUUIDv7(ctx, wf, "uuid/v1")
+```
+
+## Client APIs
+
+The `Client` provides APIs for managing workflow runs:
+
+```go
+client := flows.Client{}
+
+// Get current status of a run
+status, err := flows.GetRunStatusTx(ctx, client, tx, runKey)
+// status.Status: "queued", "running", "sleeping", "waiting_event", "completed", "failed", "cancelled"
+
+// Cancel a pending run (queued, sleeping, or waiting for event)
+err := flows.CancelRunTx(ctx, client, tx, runKey)
+
+// Get the output of a completed run
+output, err := flows.GetRunOutputTx[MyOutput](ctx, client, tx, runKey)
+```
+
+## Step Execution Options
+
+The `RetryPolicy` supports configurable retries, backoff, and timeouts:
+
+```go
+result, err := flows.Execute(ctx, wf, "step/v1", stepFn, in, flows.RetryPolicy{
+    MaxRetries:  3,                          // Retry up to 3 times after initial attempt
+    Backoff:     func(attempt int) int {     // Wait between retries (milliseconds)
+        return 100 * (1 << attempt)          // Exponential: 100ms, 200ms, 400ms
+    },
+    StepTimeout: 30 * time.Second,           // Timeout per step execution
 })
-defer worker.Stop()
-go worker.Run(ctx)
 ```
 
-#### Engine Usage
-```go
-// 4. Use engine to start workflows
-engine := flows.NewEngine(pool)
+**Step Panic Recovery**: If a step panics, the panic is caught and converted to a `StepPanicError`. The step may be retried according to the retry policy.
 
-// Tenant isolation: Extract from authentication context or use fixed value for single-tenant deployments
-tenantID := extractTenantID(authToken)
-ctx = flows.WithTenantID(ctx, tenantID)
+**Workflow Panic Recovery**: If the workflow function itself panics (outside of `Execute`), the worker catches the panic, marks the run as `failed`, and persists a stack trace in `runs.error_text`.
 
-// Start workflow asynchronously
-exec, err := flows.StartWith(engine, ctx, workflows.OrderWorkflow, &OrderInput{})
-// REST API pattern: Return 201 Created with workflow_name and workflow_id for async processing
-// Synchronous pattern: Block and wait for completion
-result, err = flows.WaitForResultWith[OrderOutput](engine, ctx, exec.WorkflowName(), exec.WorkflowID())
-```
-See [USAGE.md](USAGE.md) for additional operations: Query, Signal, Cancel
+## Stress test
 
-Finally, please check [demo](demo) folder for real world example.
-
-### Note about Workflow Name Sharding
-
-- **Original Workflow Names Required**: APIs accept the base workflow name (e.g., `"loan-application"`), not the sharded name
-- **Automatic Hash Suffix**: The library computes a shard suffix internally (e.g., `"loan-application-shard-0"`)
-- **Workers Poll All Shards**: Workers automatically poll all sharded variants of their workflow type
-- **Configurable**: Default 9 shards, configure via `flows.SetShardConfig()` before starting workflows
-
-```go
-// You use the original name - sharding happens internally
-exec, err := flows.Start(ctx, MyWorkflow, input)  // -> "my-workflow-shard-[0,8]"
-```
-
-You can create partition or sharding based on workflow_name column.
+See [examples/stress/README.md](examples/stress/README.md) for a repeatable stress harness that:
+- runs against `citusdata/citus:13.2.0`
+- scales worker containers (e.g. 5 containers)
+- enqueues A/B/C/D workflows at different volumes
+- computes DB-derived completion time stats per workflow (from `runs.created_at` / `runs.updated_at`)

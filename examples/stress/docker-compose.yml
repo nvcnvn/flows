@@ -1,0 +1,23 @@
+services:
+  citus:
+    image: citusdata/citus:13.2.0
+    environment:
+      POSTGRES_DB: flows_test
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+    ports:
+      - "5432:5432"
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: examples/stress/Dockerfile
+    depends_on:
+      - citus
+    environment:
+      DATABASE_URL: postgres://test:test@citus:5432/flows_test?sslmode=disable
+      FLOWS_SCHEMA: flows
+      FLOWS_SHARDS: "32"
+      FLOWS_TEST_ID: ${FLOWS_TEST_ID:-local}
+      FLOWS_STRESS_MODE: worker
+    command: ["--mode=worker", "--workers=1"]

@@ -21,28 +21,11 @@ jobs:
         go-version: '1.25'
         cache: true
 
-    - name: Start PostgreSQL with docker-compose
-      run: |
-        docker compose up -d postgres
-        docker compose ps
-
-    - name: Wait for PostgreSQL
-      run: |
-        until docker compose exec -T postgres pg_isready -U postgres; do
-          echo "Waiting for postgres..."
-          sleep 2
-        done
-
     - name: Run tests
       env:
         DATABASE_URL: postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable
       run: |
         go test -v -parallel 4 -race -coverprofile=coverage.txt -covermode=atomic ./...
-
-    - name: Show PostgreSQL logs (if tests failed)
-      if: failure()
-      run: |
-        docker compose logs postgres
 
   lint:
     name: Lint
