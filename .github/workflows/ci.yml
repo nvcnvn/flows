@@ -22,8 +22,6 @@ jobs:
         cache: true
 
     - name: Run tests
-      env:
-        DATABASE_URL: postgres://postgres:postgres@localhost:5433/flows_test?sslmode=disable
       run: |
         go test -v -parallel 4 -race -coverprofile=coverage.txt -covermode=atomic ./...
 
