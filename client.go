@@ -46,7 +46,7 @@ func (c Client) notifyChannel() string {
 // BeginTx enqueues a workflow run.
 //
 // Go does not support type parameters on methods, so this is a package-level generic.
-func BeginTx[I any, O any](ctx context.Context, c Client, tx pgx.Tx, wf Workflow[I, O], in *I) (RunKey, error) {
+func BeginTx[I any, O any](ctx context.Context, c Client, tx DBTX, wf Workflow[I, O], in *I) (RunKey, error) {
 	if wf == nil {
 		return RunKey{}, fmt.Errorf("workflow is nil")
 	}
@@ -79,7 +79,7 @@ func BeginTx[I any, O any](ctx context.Context, c Client, tx pgx.Tx, wf Workflow
 // PublishEventTx publishes (run-scoped) event payload, and wakes the run if it is waiting.
 //
 // Go does not support type parameters on methods, so this is a package-level generic.
-func PublishEventTx[T any](ctx context.Context, c Client, tx pgx.Tx, runKey RunKey, eventName string, payload *T) error {
+func PublishEventTx[T any](ctx context.Context, c Client, tx DBTX, runKey RunKey, eventName string, payload *T) error {
 	if eventName == "" {
 		return fmt.Errorf("eventName is empty")
 	}
@@ -119,7 +119,7 @@ type RunStatus struct {
 
 // GetRunStatusTx retrieves the current status of a workflow run.
 // Returns an error if the run is not found.
-func GetRunStatusTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) (*RunStatus, error) {
+func GetRunStatusTx(ctx context.Context, c Client, tx DBTX, runKey RunKey) (*RunStatus, error) {
 	t := c.tables()
 
 	var status RunStatus
@@ -146,7 +146,7 @@ func GetRunStatusTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) (*R
 // CancelRunTx cancels a workflow run that is queued, sleeping, or waiting for an event.
 // Runs that are currently running, already completed, already failed, or already cancelled
 // cannot be cancelled and will return an error.
-func CancelRunTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) error {
+func CancelRunTx(ctx context.Context, c Client, tx DBTX, runKey RunKey) error {
 	t := c.tables()
 
 	// Only cancel runs in interruptible states
@@ -180,7 +180,7 @@ func CancelRunTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) error 
 
 // GetRunOutputTx retrieves the output of a completed workflow run.
 // Returns an error if the run is not found or not completed.
-func GetRunOutputTx[O any](ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) (*O, error) {
+func GetRunOutputTx[O any](ctx context.Context, c Client, tx DBTX, runKey RunKey) (*O, error) {
 	t := c.tables()
 
 	var status string
