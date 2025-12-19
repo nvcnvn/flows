@@ -269,21 +269,7 @@ func (w *Worker) processOneShard(ctx context.Context, workflowName, shard string
 
 	// Query with workflow_name_shard equality predicate for Citus compatibility.
 	// This ensures FOR UPDATE SKIP LOCKED is routed to a single shard.
-	query := fmt.Sprintf(`
-SELECT run_id, input_json
-FROM %s
-WHERE workflow_name_shard = $3
-  AND workflow_name = $4
-  AND (
-    status = $1
-    OR (status = $2 AND next_wake_at IS NOT NULL AND next_wake_at <= now())
-  )
-ORDER BY created_at
-FOR UPDATE SKIP LOCKED
-LIMIT 1
-`, t.runs)
-
-	err = tx.QueryRow(ctx, query, runStatusQueued, runStatusSleeping, shard, workflowName).
+	err = tx.QueryRow(ctx, t.claimRunnableRunForShardSQL(), runStatusQueued, runStatusSleeping, shard, workflowName).
 		Scan(&runID, &inputJSON)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -302,20 +288,14 @@ LIMIT 1
 		return false, err
 	}
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		"UPDATE %s SET status = $3, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2",
-		t.runs,
-	), shard, runID, runStatusRunning)
+	_, err = tx.Exec(ctx, t.setRunRunningSQL(), shard, runID, runStatusRunning)
 	if err != nil {
 		return false, err
 	}
 
 	runner, ok := w.Registry.get(workflowName)
 	if !ok {
-		_, _ = tx.Exec(ctx, fmt.Sprintf(
-			"UPDATE %s SET status = $3, error_text = $4, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2",
-			t.runs,
-		), shard, runID, runStatusFailed, "workflow not registered: "+workflowName)
+		_, _ = tx.Exec(ctx, t.setRunFailedSQL(), shard, runID, runStatusFailed, "workflow not registered: "+workflowName)
 		err = tx.Commit(ctx)
 		return true, err
 	}
@@ -347,18 +327,12 @@ LIMIT 1
 			return true, err
 		}
 
-		_, _ = tx.Exec(ctx,
-			fmt.Sprintf("UPDATE %s SET status = $3, error_text = $4, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2", t.runs),
-			shard, runID, runStatusFailed, runErr.Error(),
-		)
+		_, _ = tx.Exec(ctx, t.setRunFailedSQL(), shard, runID, runStatusFailed, runErr.Error())
 		err = tx.Commit(ctx)
 		return true, err
 	}
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		"UPDATE %s SET status = $3, output_json = $4, error_text = NULL, next_wake_at = NULL, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2",
-		t.runs,
-	), shard, runID, runStatusCompleted, outputJSON)
+	_, err = tx.Exec(ctx, t.setRunCompletedSQL(), shard, runID, runStatusCompleted, outputJSON)
 	if err != nil {
 		return false, fmt.Errorf("persist run output: %w", err)
 	}

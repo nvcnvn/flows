@@ -17,9 +17,18 @@ Go currently does **not** support type parameters on methods, so the type-safe A
 
 Create the required tables:
 
-- Use the SQL in `flows.SchemaSQL` (see [schema.go](schema.go)).
-- By default, Flows uses the `flows` schema with unprefixed table names (`runs`, `steps`, ...).
+- Use the SQL schema in [sql](sql) folder or `flows.SchemaSQL` (see [schema.go](schema.go)).
+- Flows does not automatically create or migrate its schema at runtime.
+- By default, Flows uses the `flows` schema with table names (`runs`, `steps`, ...).
 - To install into a different schema, use `flows.SchemaSQLFor("my_schema")`.
+
+For example:
+
+```go
+if _, err := pool.Exec(ctx, flows.SchemaSQLFor("my_schema")); err != nil {
+    return err
+}
+```
 
 To point the worker/client at a custom schema:
 
@@ -32,7 +41,7 @@ worker := flows.Worker{Pool: pool, Registry: reg, DBConfig: cfg}
 
 ## Sharding (Citus)
 
-Flows supports sharded Postgres setups (e.g. Citus) by routing all reads/writes using a
+Flows supports sharded Postgres setups with Citus by routing all reads/writes using a
 distribution column `workflow_name_shard`.
 
 - Configure shard fan-out via `flows.DBConfig{ShardCount: N}`.
@@ -40,6 +49,7 @@ distribution column `workflow_name_shard`.
 - The primary key for a run is `(workflow_name_shard, run_id)`; all child tables include the same shard key.
 
 Because of this, run identifiers are represented as `flows.RunKey`:
+Note: if you don't use Citus then vanilla Postgres partition will help.
 
 ```go
 type RunKey struct {

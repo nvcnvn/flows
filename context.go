@@ -114,7 +114,7 @@ func Execute[I any, O any](ctx context.Context, c *Context, stepKey string, step
 		var status string
 		var outputJSON []byte
 		err := c.tx.QueryRow(ctx,
-			fmt.Sprintf("SELECT status, output_json FROM %s WHERE workflow_name_shard = $1 AND run_id = $2 AND step_key = $3", c.t.steps),
+			c.t.selectStepStatusSQL(),
 			c.runKey.WorkflowNameShard, string(c.runKey.RunID), stepKey,
 		).Scan(&status, &outputJSON)
 		if err == nil && status == stepStatusCompleted {
@@ -149,16 +149,7 @@ func Execute[I any, O any](ctx context.Context, c *Context, stepKey string, step
 				return nil, fmt.Errorf("marshal step input: %w", err)
 			}
 
-			_, err = c.tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s (workflow_name_shard, run_id, step_key, status, input_json, output_json, attempts, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-			ON CONFLICT (workflow_name_shard, run_id, step_key) DO UPDATE
-	SET status = EXCLUDED.status,
-		input_json = EXCLUDED.input_json,
-		output_json = EXCLUDED.output_json,
-		attempts = EXCLUDED.attempts,
-		updated_at = EXCLUDED.updated_at
-`, c.t.steps), c.runKey.WorkflowNameShard, string(c.runKey.RunID), stepKey, stepStatusCompleted, inputJSON, outputJSON, attempt+1)
+			_, err = c.tx.Exec(ctx, c.t.upsertStepCompletedSQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), stepKey, stepStatusCompleted, inputJSON, outputJSON, attempt+1)
 			if err != nil {
 				return nil, fmt.Errorf("persist step output: %w", err)
 			}
@@ -166,15 +157,7 @@ func Execute[I any, O any](ctx context.Context, c *Context, stepKey string, step
 		}
 
 		lastErr = err
-		_, _ = c.tx.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO %s (workflow_name_shard, run_id, step_key, status, error_text, attempts, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, now())
-		ON CONFLICT (workflow_name_shard, run_id, step_key) DO UPDATE
-	SET status = EXCLUDED.status,
-		error_text = EXCLUDED.error_text,
-		attempts = EXCLUDED.attempts,
-		updated_at = EXCLUDED.updated_at
-`, c.t.steps), c.runKey.WorkflowNameShard, string(c.runKey.RunID), stepKey, stepStatusFailed, err.Error(), attempt+1)
+		_, _ = c.tx.Exec(ctx, c.t.upsertStepFailedSQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), stepKey, stepStatusFailed, err.Error(), attempt+1)
 
 		if attempt < maxRetries {
 			if retry.Backoff != nil {
@@ -211,7 +194,7 @@ func Sleep(ctx context.Context, c *Context, waitKey string, duration time.Durati
 		var wakeAtDB time.Time
 		var satisfiedAt *time.Time
 		err := c.tx.QueryRow(ctx,
-			fmt.Sprintf("SELECT wake_at, satisfied_at FROM %s WHERE workflow_name_shard = $1 AND run_id = $2 AND wait_key = $3 AND wait_type = $4", c.t.waits),
+			c.t.selectWaitStateSQL(),
 			c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeSleep,
 		).Scan(&wakeAtDB, &satisfiedAt)
 		if err == nil {
@@ -220,7 +203,7 @@ func Sleep(ctx context.Context, c *Context, waitKey string, duration time.Durati
 			}
 			if !c.now().Before(wakeAtDB) {
 				_, _ = c.tx.Exec(ctx,
-					fmt.Sprintf("UPDATE %s SET satisfied_at = now(), updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2 AND wait_key = $3", c.t.waits),
+					c.t.satisfySleepWaitSQL(),
 					c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey,
 				)
 				return
@@ -229,19 +212,13 @@ func Sleep(ctx context.Context, c *Context, waitKey string, duration time.Durati
 		}
 	}
 
-	_, err := c.tx.Exec(ctx, fmt.Sprintf(`
-	INSERT INTO %s (workflow_name_shard, run_id, wait_key, wait_type, wake_at, updated_at)
-	VALUES ($1, $2, $3, $4, $5, now())
-	ON CONFLICT (workflow_name_shard, run_id, wait_key) DO UPDATE
-	SET wake_at = EXCLUDED.wake_at,
-		updated_at = EXCLUDED.updated_at
-`, c.t.waits), c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeSleep, wakeAt)
+	_, err := c.tx.Exec(ctx, c.t.upsertSleepWaitSQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeSleep, wakeAt)
 	if err != nil {
 		panic(fmt.Errorf("persist sleep wait: %w", err))
 	}
 
 	_, err = c.tx.Exec(ctx,
-		fmt.Sprintf("UPDATE %s SET status = $3, next_wake_at = $4, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2", c.t.runs),
+		c.t.setRunSleepingSQL(),
 		c.runKey.WorkflowNameShard, string(c.runKey.RunID), runStatusSleeping, wakeAt,
 	)
 	if err != nil {
@@ -267,7 +244,7 @@ func WaitForEvent[T any](ctx context.Context, c *Context, waitKey string, eventN
 		var payloadJSON []byte
 		var satisfiedAt *time.Time
 		err := c.tx.QueryRow(ctx,
-			fmt.Sprintf("SELECT payload_json, satisfied_at FROM %s WHERE workflow_name_shard = $1 AND run_id = $2 AND wait_key = $3 AND wait_type = $4", c.t.waits),
+			c.t.selectWaitPayloadSQL(),
 			c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeEvent,
 		).Scan(&payloadJSON, &satisfiedAt)
 		if err == nil && satisfiedAt != nil {
@@ -283,18 +260,11 @@ func WaitForEvent[T any](ctx context.Context, c *Context, waitKey string, eventN
 	{
 		var payloadJSON []byte
 		err := c.tx.QueryRow(ctx,
-			fmt.Sprintf("SELECT payload_json FROM %s WHERE workflow_name_shard = $1 AND run_id = $2 AND event_name = $3", c.t.events),
+			c.t.selectEventPayloadSQL(),
 			c.runKey.WorkflowNameShard, string(c.runKey.RunID), eventName,
 		).Scan(&payloadJSON)
 		if err == nil {
-			_, _ = c.tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s (workflow_name_shard, run_id, wait_key, wait_type, event_name, payload_json, satisfied_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, now(), now())
-			ON CONFLICT (workflow_name_shard, run_id, wait_key) DO UPDATE
-	SET payload_json = EXCLUDED.payload_json,
-		satisfied_at = EXCLUDED.satisfied_at,
-		updated_at = EXCLUDED.updated_at
-`, c.t.waits), c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeEvent, eventName, payloadJSON)
+			_, _ = c.tx.Exec(ctx, c.t.upsertSatisfiedEventWaitSQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeEvent, eventName, payloadJSON)
 
 			var out T
 			if err := c.codec.Unmarshal(payloadJSON, &out); err != nil {
@@ -305,19 +275,13 @@ func WaitForEvent[T any](ctx context.Context, c *Context, waitKey string, eventN
 	}
 
 	// Otherwise, persist the wait and yield.
-	_, err := c.tx.Exec(ctx, fmt.Sprintf(`
-	INSERT INTO %s (workflow_name_shard, run_id, wait_key, wait_type, event_name, updated_at)
-	VALUES ($1, $2, $3, $4, $5, now())
-	ON CONFLICT (workflow_name_shard, run_id, wait_key) DO UPDATE
-	SET event_name = EXCLUDED.event_name,
-		updated_at = EXCLUDED.updated_at
-`, c.t.waits), c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeEvent, eventName)
+	_, err := c.tx.Exec(ctx, c.t.upsertEventWaitSQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey, waitTypeEvent, eventName)
 	if err != nil {
 		panic(fmt.Errorf("persist event wait: %w", err))
 	}
 
 	_, err = c.tx.Exec(ctx,
-		fmt.Sprintf("UPDATE %s SET status = $3, next_wake_at = NULL, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2", c.t.runs),
+		c.t.setRunWaitingEventSQL(),
 		c.runKey.WorkflowNameShard, string(c.runKey.RunID), runStatusWaitingEvent,
 	)
 	if err != nil {
@@ -335,7 +299,7 @@ func RandomUUIDv7(ctx context.Context, c *Context, key string) string {
 
 	var val string
 	err := c.tx.QueryRow(ctx,
-		fmt.Sprintf("SELECT value_text FROM %s WHERE workflow_name_shard = $1 AND run_id = $2 AND rand_key = $3 AND kind = 'uuidv7'", c.t.random),
+		c.t.selectRandomUUIDv7SQL(),
 		c.runKey.WorkflowNameShard, string(c.runKey.RunID), key,
 	).Scan(&val)
 	if err == nil {
@@ -347,13 +311,7 @@ func RandomUUIDv7(ctx context.Context, c *Context, key string) string {
 		panic(fmt.Errorf("generate uuidv7: %w", err))
 	}
 
-	_, err = c.tx.Exec(ctx, fmt.Sprintf(`
-	INSERT INTO %s (workflow_name_shard, run_id, rand_key, kind, value_text)
-	VALUES ($1, $2, $3, 'uuidv7', $4)
-	ON CONFLICT (workflow_name_shard, run_id, rand_key) DO UPDATE
-	SET kind = EXCLUDED.kind,
-		value_text = EXCLUDED.value_text
-`, c.t.random), c.runKey.WorkflowNameShard, string(c.runKey.RunID), key, uuid)
+	_, err = c.tx.Exec(ctx, c.t.upsertRandomUUIDv7SQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), key, uuid)
 	if err != nil {
 		panic(fmt.Errorf("persist uuidv7: %w", err))
 	}
@@ -368,7 +326,7 @@ func RandomUint64(ctx context.Context, c *Context, key string) uint64 {
 
 	var val int64
 	err := c.tx.QueryRow(ctx,
-		fmt.Sprintf("SELECT value_bigint FROM %s WHERE workflow_name_shard = $1 AND run_id = $2 AND rand_key = $3 AND kind = 'uint64'", c.t.random),
+		c.t.selectRandomUint64SQL(),
 		c.runKey.WorkflowNameShard, string(c.runKey.RunID), key,
 	).Scan(&val)
 	if err == nil {
@@ -380,13 +338,7 @@ func RandomUint64(ctx context.Context, c *Context, key string) uint64 {
 		panic(fmt.Errorf("generate uint64: %w", err))
 	}
 
-	_, err = c.tx.Exec(ctx, fmt.Sprintf(`
-	INSERT INTO %s (workflow_name_shard, run_id, rand_key, kind, value_bigint)
-	VALUES ($1, $2, $3, 'uint64', $4)
-	ON CONFLICT (workflow_name_shard, run_id, rand_key) DO UPDATE
-	SET kind = EXCLUDED.kind,
-		value_bigint = EXCLUDED.value_bigint
-`, c.t.random), c.runKey.WorkflowNameShard, string(c.runKey.RunID), key, int64(u))
+	_, err = c.tx.Exec(ctx, c.t.upsertRandomUint64SQL(), c.runKey.WorkflowNameShard, string(c.runKey.RunID), key, int64(u))
 	if err != nil {
 		panic(fmt.Errorf("persist uint64: %w", err))
 	}

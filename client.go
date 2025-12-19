@@ -65,10 +65,7 @@ func BeginTx[I any, O any](ctx context.Context, c Client, tx pgx.Tx, wf Workflow
 	shard := workflowNameShard(workflowName, runID, c.DBConfig.shardCount())
 	runKey := RunKey{WorkflowNameShard: shard, RunID: runID}
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s (workflow_name_shard, run_id, workflow_name, status, input_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, now(), now())",
-		t.runs,
-	), shard, string(runID), workflowName, runStatusQueued, inputJSON)
+	_, err = tx.Exec(ctx, t.insertRunSQL(), shard, string(runID), workflowName, runStatusQueued, inputJSON)
 	if err != nil {
 		return RunKey{}, fmt.Errorf("insert run: %w", err)
 	}
@@ -93,34 +90,16 @@ func PublishEventTx[T any](ctx context.Context, c Client, tx pgx.Tx, runKey RunK
 
 	t := c.tables()
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(`
-	INSERT INTO %s (workflow_name_shard, run_id, event_name, payload_json)
-	VALUES ($1, $2, $3, $4)
-	ON CONFLICT (workflow_name_shard, run_id, event_name) DO UPDATE
-	SET payload_json = EXCLUDED.payload_json
-`, t.events), runKey.WorkflowNameShard, string(runKey.RunID), eventName, payloadJSON)
+	_, err = tx.Exec(ctx, t.upsertEventSQL(), runKey.WorkflowNameShard, string(runKey.RunID), eventName, payloadJSON)
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
 
 	// If a matching wait exists, satisfy it.
-	_, _ = tx.Exec(ctx, fmt.Sprintf(`
-UPDATE %s
-	SET payload_json = $5,
-		satisfied_at = now(),
-		updated_at = now()
-	WHERE workflow_name_shard = $1
-		AND run_id = $2
-		AND wait_type = $3
-		AND event_name = $4
-		AND satisfied_at IS NULL
-`, t.waits), runKey.WorkflowNameShard, string(runKey.RunID), waitTypeEvent, eventName, payloadJSON)
+	_, _ = tx.Exec(ctx, t.satisfyEventWaitSQL(), runKey.WorkflowNameShard, string(runKey.RunID), waitTypeEvent, eventName, payloadJSON)
 
 	// Wake the run.
-	_, _ = tx.Exec(ctx, fmt.Sprintf(
-		"UPDATE %s SET status = $3, updated_at = now() WHERE workflow_name_shard = $1 AND run_id = $2 AND status = $4",
-		t.runs,
-	), runKey.WorkflowNameShard, string(runKey.RunID), runStatusQueued, runStatusWaitingEvent)
+	_, _ = tx.Exec(ctx, t.wakeRunFromEventSQL(), runKey.WorkflowNameShard, string(runKey.RunID), runStatusQueued, runStatusWaitingEvent)
 
 	// Hint workers that this run may now be runnable.
 	// Notification is best-effort; polling is the fallback.
@@ -145,11 +124,7 @@ func GetRunStatusTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) (*R
 
 	var status RunStatus
 	var errorText *string
-	err := tx.QueryRow(ctx, fmt.Sprintf(`
-		SELECT status, error_text, created_at, updated_at, next_wake_at
-		FROM %s
-		WHERE workflow_name_shard = $1 AND run_id = $2
-	`, t.runs), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(
+	err := tx.QueryRow(ctx, t.getRunStatusSQL(), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(
 		&status.Status,
 		&errorText,
 		&status.CreatedAt,
@@ -175,12 +150,7 @@ func CancelRunTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) error 
 	t := c.tables()
 
 	// Only cancel runs in interruptible states
-	result, err := tx.Exec(ctx, fmt.Sprintf(`
-		UPDATE %s
-		SET status = $3, error_text = 'cancelled by user', updated_at = now()
-		WHERE workflow_name_shard = $1 AND run_id = $2
-		AND status IN ($4, $5, $6)
-	`, t.runs),
+	result, err := tx.Exec(ctx, t.cancelRunSQL(),
 		runKey.WorkflowNameShard,
 		string(runKey.RunID),
 		runStatusCancelled,
@@ -195,9 +165,7 @@ func CancelRunTx(ctx context.Context, c Client, tx pgx.Tx, runKey RunKey) error 
 	if result.RowsAffected() == 0 {
 		// Check if run exists and why it couldn't be cancelled
 		var currentStatus string
-		err := tx.QueryRow(ctx, fmt.Sprintf(`
-			SELECT status FROM %s WHERE workflow_name_shard = $1 AND run_id = $2
-		`, t.runs), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(&currentStatus)
+		err := tx.QueryRow(ctx, t.getRunStatusOnlySQL(), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(&currentStatus)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				return fmt.Errorf("run not found: %s", runKey.RunID)
@@ -217,11 +185,7 @@ func GetRunOutputTx[O any](ctx context.Context, c Client, tx pgx.Tx, runKey RunK
 
 	var status string
 	var outputJSON []byte
-	err := tx.QueryRow(ctx, fmt.Sprintf(`
-		SELECT status, output_json
-		FROM %s
-		WHERE workflow_name_shard = $1 AND run_id = $2
-	`, t.runs), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(&status, &outputJSON)
+	err := tx.QueryRow(ctx, t.getRunOutputSQL(), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(&status, &outputJSON)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, fmt.Errorf("run not found: %s", runKey.RunID)
