@@ -271,3 +271,20 @@ func (t dbTables) advanceScheduleSQL() string {
 		WHERE schedule_id = $1
 	`
 }
+
+func (t dbTables) setScheduleEnabledSQL() string {
+	return `
+		UPDATE ` + t.schedules + `
+		SET enabled = $2,
+			updated_at = $3
+		WHERE schedule_id = $1
+	`
+}
+
+func (t dbTables) getScheduleEnabledSQL() string {
+	return `
+		SELECT enabled
+		FROM ` + t.schedules + `
+		WHERE schedule_id = $1
+	`
+}

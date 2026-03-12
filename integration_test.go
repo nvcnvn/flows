@@ -3388,3 +3388,82 @@ func TestCronSchedule_MultipleWorkers(t *testing.T) {
 
 	t.Logf("Multi-worker cron test: %d runs from %d workers", runCount, numWorkers)
 }
+
+// TestCronSchedule_PauseResume verifies that PauseScheduleTx stops new cron
+// runs and ResumeScheduleTx re-enables them.
+func TestCronSchedule_PauseResume(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+	flows.RegisterCron(registry, wf, &CronInput{Tag: "pause-test"}, "pausable", flows.Every(60*time.Millisecond))
+
+	worker := &flows.Worker{
+		Pool:          pool,
+		Registry:      registry,
+		PollInterval:  50 * time.Millisecond,
+		DisableNotify: true,
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(workerCtx)
+	}()
+
+	// Wait for some runs to be created.
+	time.Sleep(300 * time.Millisecond)
+	before := wf.Executions.Load()
+	if before == 0 {
+		t.Fatal("Expected at least 1 cron execution before pause")
+	}
+
+	// Pause the schedule.
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.PauseScheduleTx(ctx, client, tx, "pausable"); err != nil {
+		t.Fatalf("PauseScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Record the count and wait; no new runs should appear.
+	afterPause := wf.Executions.Load()
+	time.Sleep(300 * time.Millisecond)
+	afterWait := wf.Executions.Load()
+	if afterWait != afterPause {
+		t.Errorf("Expected no new executions while paused, got %d → %d", afterPause, afterWait)
+	}
+
+	// Resume the schedule.
+	tx2, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ResumeScheduleTx(ctx, client, tx2, "pausable"); err != nil {
+		t.Fatalf("ResumeScheduleTx: %v", err)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Backdate next_run_at so it fires immediately after resume.
+	_, _ = pool.Exec(ctx, "UPDATE flows.schedules SET next_run_at = now() - interval '1 minute' WHERE schedule_id = 'pausable'")
+	time.Sleep(300 * time.Millisecond)
+
+	afterResume := wf.Executions.Load()
+	if afterResume <= afterWait {
+		t.Errorf("Expected new executions after resume, got %d → %d", afterWait, afterResume)
+	}
+
+	cancel()
+	<-errCh
+	t.Logf("Pause/resume test: before=%d paused=%d resumed=%d", before, afterWait, afterResume)
+}

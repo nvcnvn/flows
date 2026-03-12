@@ -128,6 +128,12 @@ err := flows.CancelRunTx(ctx, client, tx, runKey)
 
 // Get the output of a completed run
 output, err := flows.GetRunOutputTx[MyOutput](ctx, client, tx, runKey)
+
+// Pause a cron schedule (stops creating new runs)
+err := flows.PauseScheduleTx(ctx, client, tx, "my-schedule")
+
+// Resume a paused cron schedule
+err := flows.ResumeScheduleTx(ctx, client, tx, "my-schedule")
 ```
 
 ## Step Execution Options
@@ -203,6 +209,25 @@ _ = worker.Run(ctx)
 The schedule ID (`"my-schedule"` above) uniquely identifies the schedule row.
 Use a stable string (e.g. the workflow name) so the row survives redeploys.
 If you omit the schedule ID (empty string), it defaults to `wf.Name()`.
+
+### Pausing and resuming
+
+You can pause a schedule at runtime so it stops creating new runs. Runs that
+are already in progress are not affected. Resume re-enables it.
+
+```go
+client := flows.Client{}
+
+// Inside a transaction:
+err := flows.PauseScheduleTx(ctx, client, tx, "my-schedule")
+
+// Later, re-enable:
+err := flows.ResumeScheduleTx(ctx, client, tx, "my-schedule")
+```
+
+When a worker starts, `syncCronSchedules` re-upserts all registered schedules
+with `enabled = true`, so a paused schedule is automatically resumed on the
+next deploy unless you remove it from `RegisterCron`.
 
 ### Example
 

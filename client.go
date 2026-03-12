@@ -203,3 +203,34 @@ func GetRunOutputTx[O any](ctx context.Context, c Client, tx DBTX, runKey RunKey
 	}
 	return &out, nil
 }
+
+// PauseScheduleTx disables a cron schedule so it stops creating new runs.
+// The schedule row is preserved; call ResumeScheduleTx to re-enable it.
+// Returns an error if the schedule is not found.
+func PauseScheduleTx(ctx context.Context, c Client, tx DBTX, scheduleID string) error {
+	return setScheduleEnabled(ctx, c, tx, scheduleID, false)
+}
+
+// ResumeScheduleTx re-enables a previously paused cron schedule.
+// Returns an error if the schedule is not found.
+func ResumeScheduleTx(ctx context.Context, c Client, tx DBTX, scheduleID string) error {
+	return setScheduleEnabled(ctx, c, tx, scheduleID, true)
+}
+
+func setScheduleEnabled(ctx context.Context, c Client, tx DBTX, scheduleID string, enabled bool) error {
+	if scheduleID == "" {
+		return fmt.Errorf("scheduleID is empty")
+	}
+
+	t := c.tables()
+	now := c.now()
+
+	result, err := tx.Exec(ctx, t.setScheduleEnabledSQL(), scheduleID, enabled, now)
+	if err != nil {
+		return fmt.Errorf("set schedule enabled: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("schedule not found: %s", scheduleID)
+	}
+	return nil
+}
