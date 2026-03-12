@@ -156,27 +156,26 @@ result, err := flows.Execute(ctx, wf, "step/v1", stepFn, in, flows.RetryPolicy{
 
 ## Cron Schedules
 
-Flows supports automatic, recurring workflow runs via cron schedules. Instead of
-calling `flows.BeginTx` explicitly, you register a cron schedule and the worker
-creates runs on the configured cadence.
+Flows supports automatic, recurring workflow runs via cron schedules.
 
 ### How it works
 
-1. **Registration**: At startup you call `flows.RegisterCron` to associate a
-   workflow + input + schedule. This also registers the workflow if it isn't
-   already.
-2. **Sync**: When `worker.Run(ctx)` starts, it upserts every registered schedule
-   into a `schedules` table (next fire time, cron expression, input JSON). If the
-   cron expression hasn't changed since the last deploy, the existing
-   `next_run_at` is preserved; if the expression changed, it's recalculated.
-3. **Polling**: A dedicated cron goroutine polls for schedules whose
+1. **Registration**: At startup, register your workflow template with
+   `flows.Register(reg, wf)` as usual.
+2. **Scheduling**: Call `flows.ScheduleTx(...)` — from an HTTP handler, a
+   migration, init code, or anywhere you have a transaction — to create or
+   update a schedule row in the `schedules` table.
+3. **Polling**: The worker's cron goroutine polls for schedules whose
    `next_run_at <= now()`. It claims a row with `FOR UPDATE SKIP LOCKED`
    (same pattern as workflow runs), inserts a new run, and advances
-   `next_run_at`—all in one transaction.
+   `next_run_at` — all in one transaction.
 4. **Execution**: The new run is picked up by the normal workflow worker loop.
 
 Multiple workers share the same `schedules` table. `FOR UPDATE SKIP LOCKED`
 guarantees exactly one worker fires each schedule tick, so no duplicate runs.
+
+Because schedules live in the database, they can be created, updated, paused,
+resumed, and deleted at runtime without restarting workers.
 
 ### Schedules
 
@@ -195,13 +194,24 @@ The cron parser supports standard 5-field syntax
 
 ```go
 reg := flows.NewRegistry()
+flows.Register(reg, myWorkflow)
 
-// Register a cron that runs myWorkflow every 5 minutes with a fixed input.
-flows.RegisterCron(reg, myWorkflow, &MyInput{Value: "cron"}, "my-schedule", flows.Every(5*time.Minute))
+client := flows.Client{}
 
-// Or use a standard cron expression (every day at 02:30 UTC):
-flows.RegisterCron(reg, myWorkflow, &MyInput{Value: "nightly"}, "nightly-job", flows.MustParseCron("30 2 * * *"))
+// Create a schedule — can be called at any time (init, HTTP handler, migration).
+tx, _ := pool.Begin(ctx)
+flows.ScheduleTx(ctx, client, tx, myWorkflow, &MyInput{Value: "cron"}, "my-schedule", flows.Every(5*time.Minute))
+tx.Commit(ctx)
 
+// Or use a cron expression and fire an immediate run too:
+tx, _ = pool.Begin(ctx)
+flows.ScheduleTx(ctx, client, tx, myWorkflow, &MyInput{Value: "nightly"}, "nightly-job",
+    flows.MustParseCron("30 2 * * *"),
+    flows.WithRunNow(),  // also creates one run immediately
+)
+tx.Commit(ctx)
+
+// Start the worker — it picks up schedules from the database automatically.
 worker := flows.Worker{Pool: pool, Registry: reg}
 _ = worker.Run(ctx)
 ```
@@ -210,24 +220,20 @@ The schedule ID (`"my-schedule"` above) uniquely identifies the schedule row.
 Use a stable string (e.g. the workflow name) so the row survives redeploys.
 If you omit the schedule ID (empty string), it defaults to `wf.Name()`.
 
-### Pausing and resuming
-
-You can pause a schedule at runtime so it stops creating new runs. Runs that
-are already in progress are not affected. Resume re-enables it.
+### Pausing, resuming, and deleting
 
 ```go
 client := flows.Client{}
 
-// Inside a transaction:
-err := flows.PauseScheduleTx(ctx, client, tx, "my-schedule")
+// Pause — stops creating new runs; existing runs are not affected.
+flows.PauseScheduleTx(ctx, client, tx, "my-schedule")
 
-// Later, re-enable:
-err := flows.ResumeScheduleTx(ctx, client, tx, "my-schedule")
+// Resume — re-enables a paused schedule.
+flows.ResumeScheduleTx(ctx, client, tx, "my-schedule")
+
+// Delete — permanently removes the schedule row.
+flows.DeleteScheduleTx(ctx, client, tx, "my-schedule")
 ```
-
-When a worker starts, `syncCronSchedules` re-upserts all registered schedules
-with `enabled = true`, so a paused schedule is automatically resumed on the
-next deploy unless you remove it from `RegisterCron`.
 
 ### Example
 

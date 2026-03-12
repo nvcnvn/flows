@@ -3224,9 +3224,20 @@ func TestCronSchedule_CreatesRuns(t *testing.T) {
 
 	registry := flows.NewRegistry()
 	wf := &CronWorkflow{}
+	flows.Register(registry, wf)
 
-	// Register with a very short interval so the test completes quickly.
-	flows.RegisterCron(registry, wf, &CronInput{Tag: "cron-test"}, "", flows.Every(100*time.Millisecond))
+	// Create the schedule via ScheduleTx (runtime API).
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ScheduleTx(ctx, client, tx, wf, &CronInput{Tag: "cron-test"}, "", flows.Every(100*time.Millisecond)); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
 
 	worker := &flows.Worker{
 		Pool:          pool,
@@ -3244,7 +3255,7 @@ func TestCronSchedule_CreatesRuns(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	cancel()
-	err := <-errCh
+	err = <-errCh
 	if err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Worker error: %v", err)
 	}
@@ -3286,10 +3297,20 @@ func TestCronSchedule_CronExpr(t *testing.T) {
 
 	registry := flows.NewRegistry()
 	wf := &CronWorkflow{}
+	flows.Register(registry, wf)
 
-	// Register with a cron expression. We'll manipulate next_run_at directly
-	// to test that the worker picks it up.
-	flows.RegisterCron(registry, wf, &CronInput{Tag: "cron-expr"}, "", flows.MustParseCron("*/5 * * * *"))
+	// Create a schedule with a cron expression via ScheduleTx.
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ScheduleTx(ctx, client, tx, wf, &CronInput{Tag: "cron-expr"}, "", flows.MustParseCron("*/5 * * * *")); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
 
 	worker := &flows.Worker{
 		Pool:          pool,
@@ -3298,8 +3319,6 @@ func TestCronSchedule_CronExpr(t *testing.T) {
 		DisableNotify: true,
 	}
 
-	// Sync schedules first.
-	// We need to make the schedule "due" by backdating next_run_at.
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -3308,11 +3327,11 @@ func TestCronSchedule_CronExpr(t *testing.T) {
 		errCh <- worker.Run(workerCtx)
 	}()
 
-	// Give time for sync and processing.
+	// Give time for processing.
 	time.Sleep(100 * time.Millisecond)
 
 	// Backdate next_run_at so the schedule appears due.
-	_, err := pool.Exec(ctx,
+	_, err = pool.Exec(ctx,
 		"UPDATE flows.schedules SET next_run_at = now() - interval '1 minute' WHERE schedule_id = 'cron_workflow'")
 	if err != nil {
 		t.Fatalf("Failed to backdate schedule: %v", err)
@@ -3345,7 +3364,20 @@ func TestCronSchedule_MultipleWorkers(t *testing.T) {
 
 	registry := flows.NewRegistry()
 	wf := &CronWorkflow{}
-	flows.RegisterCron(registry, wf, &CronInput{Tag: "multi-worker"}, "", flows.Every(80*time.Millisecond))
+	flows.Register(registry, wf)
+
+	// Create the schedule via ScheduleTx.
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ScheduleTx(ctx, client, tx, wf, &CronInput{Tag: "multi-worker"}, "", flows.Every(80*time.Millisecond)); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
 
 	numWorkers := 3
 	errChs := make([]chan error, numWorkers)
@@ -3397,7 +3429,20 @@ func TestCronSchedule_PauseResume(t *testing.T) {
 
 	registry := flows.NewRegistry()
 	wf := &CronWorkflow{}
-	flows.RegisterCron(registry, wf, &CronInput{Tag: "pause-test"}, "pausable", flows.Every(60*time.Millisecond))
+	flows.Register(registry, wf)
+
+	// Create the schedule via ScheduleTx.
+	client := flows.Client{}
+	tx0, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ScheduleTx(ctx, client, tx0, wf, &CronInput{Tag: "pause-test"}, "pausable", flows.Every(60*time.Millisecond)); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx0.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
 
 	worker := &flows.Worker{
 		Pool:          pool,
@@ -3422,15 +3467,14 @@ func TestCronSchedule_PauseResume(t *testing.T) {
 	}
 
 	// Pause the schedule.
-	client := flows.Client{}
-	tx, err := pool.Begin(ctx)
+	tx1, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := flows.PauseScheduleTx(ctx, client, tx, "pausable"); err != nil {
+	if err := flows.PauseScheduleTx(ctx, client, tx1, "pausable"); err != nil {
 		t.Fatalf("PauseScheduleTx: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx1.Commit(ctx); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -3466,4 +3510,148 @@ func TestCronSchedule_PauseResume(t *testing.T) {
 	cancel()
 	<-errCh
 	t.Logf("Pause/resume test: before=%d paused=%d resumed=%d", before, afterWait, afterResume)
+}
+
+// TestCronSchedule_ScheduleDeleteTx verifies that ScheduleTx inserts a
+// schedule at runtime and DeleteScheduleTx removes it.
+func TestCronSchedule_ScheduleDeleteTx(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	// Register the workflow only — no schedule yet.
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+	flows.Register(registry, wf)
+
+	worker := &flows.Worker{
+		Pool:          pool,
+		Registry:      registry,
+		PollInterval:  50 * time.Millisecond,
+		DisableNotify: true,
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(workerCtx)
+	}()
+
+	// At this point no schedule exists — worker hasn't created any runs.
+	time.Sleep(100 * time.Millisecond)
+	if n := wf.Executions.Load(); n != 0 {
+		t.Fatalf("Expected 0 executions before ScheduleTx, got %d", n)
+	}
+
+	// Dynamically create a schedule via the client API.
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ScheduleTx(ctx, client, tx, wf,
+		&CronInput{Tag: "runtime-schedule"},
+		"runtime-cron",
+		flows.Every(60*time.Millisecond),
+	); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Wait for the worker to pick up the new schedule and create runs.
+	time.Sleep(400 * time.Millisecond)
+	afterCreate := wf.Executions.Load()
+	if afterCreate == 0 {
+		t.Fatal("Expected executions after ScheduleTx, got 0")
+	}
+
+	// Delete the schedule — no more runs should be created.
+	tx2, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.DeleteScheduleTx(ctx, client, tx2, "runtime-cron"); err != nil {
+		t.Fatalf("DeleteScheduleTx: %v", err)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	afterDelete := wf.Executions.Load()
+	time.Sleep(300 * time.Millisecond)
+	afterWait := wf.Executions.Load()
+	if afterWait != afterDelete {
+		t.Errorf("Expected no new executions after DeleteScheduleTx, got %d extra", afterWait-afterDelete)
+	}
+
+	// Verify DeleteScheduleTx returns error for missing schedule.
+	tx3, _ := pool.Begin(ctx)
+	err = flows.DeleteScheduleTx(ctx, client, tx3, "nonexistent")
+	_ = tx3.Rollback(ctx)
+	if err == nil {
+		t.Error("Expected error for nonexistent schedule, got nil")
+	}
+
+	cancel()
+	<-errCh
+	t.Logf("ScheduleDelete test: created=%d deleted=%d", afterCreate, afterDelete)
+}
+
+// TestCronSchedule_WithRunNow verifies that WithRunNow fires an immediate run
+// in addition to setting up the recurring schedule.
+func TestCronSchedule_WithRunNow(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+	flows.Register(registry, wf)
+
+	worker := &flows.Worker{
+		Pool:          pool,
+		Registry:      registry,
+		PollInterval:  50 * time.Millisecond,
+		DisableNotify: true,
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(workerCtx)
+	}()
+
+	// Create a schedule with a far-future cron so only WithRunNow fires.
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := flows.ScheduleTx(ctx, client, tx, wf,
+		&CronInput{Tag: "run-now"},
+		"run-now-sched",
+		flows.MustParseCron("0 0 1 1 *"), // once a year
+		flows.WithRunNow(),
+	); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Wait for the immediate run to be processed.
+	time.Sleep(300 * time.Millisecond)
+
+	executions := wf.Executions.Load()
+	if executions != 1 {
+		t.Errorf("Expected exactly 1 execution from WithRunNow, got %d", executions)
+	}
+
+	cancel()
+	<-errCh
+	t.Logf("WithRunNow test: executions=%d", executions)
 }

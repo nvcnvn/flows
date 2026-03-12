@@ -71,33 +71,54 @@ func main() {
 	}
 
 	// -----------------------------------------------------------------------
-	// Registry: register the workflow + a cron schedule.
+	// Registry: register the workflow template.
 	// -----------------------------------------------------------------------
 	reg := flows.NewRegistry()
 
 	report := &DailyReport{}
+	flows.Register(reg, report)
 
-	// Option A: fixed interval — run every 5 minutes.
-	flows.RegisterCron(reg, report,
+	// -----------------------------------------------------------------------
+	// Create a cron schedule via the runtime API (ScheduleTx).
+	// This can be called at any time — here, at init, or from an HTTP handler.
+	// -----------------------------------------------------------------------
+	client := flows.Client{}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	// Option A: fixed interval — run every 5 minutes, plus fire once immediately.
+	if err := flows.ScheduleTx(ctx, client, tx, report,
 		&DailyReportInput{ReportType: "interval"},
 		"daily_report_interval",    // unique schedule ID
 		flows.Every(5*time.Minute), // fires every 5 min
-	)
+		flows.WithRunNow(),         // also fire an immediate run
+	); err != nil {
+		panic(err)
+	}
 
 	// Option B: cron expression — run at 02:30 UTC every day.
 	// (Uncomment one or both; each needs a unique schedule ID.)
 	//
-	// flows.RegisterCron(reg, report,
+	// if err := flows.ScheduleTx(ctx, client, tx, report,
 	// 	&DailyReportInput{ReportType: "nightly"},
 	// 	"daily_report_nightly",
 	// 	flows.MustParseCron("30 2 * * *"),
-	// )
+	// ); err != nil {
+	// 	panic(err)
+	// }
+
+	if err := tx.Commit(ctx); err != nil {
+		panic(err)
+	}
 
 	// -----------------------------------------------------------------------
 	// Start the worker. It will:
-	//   1. Upsert schedule rows into the "schedules" table.
-	//   2. Start a cron polling loop alongside the regular workflow loop.
-	//   3. When a schedule is due, create a run and advance next_run_at.
+	//   1. Start a cron polling loop alongside the regular workflow loop.
+	//   2. When a schedule is due, create a run and advance next_run_at.
+	//   3. The immediate WithRunNow run is also processed.
 	// -----------------------------------------------------------------------
 	fmt.Println("starting worker — cron schedules will create runs automatically")
 	worker := flows.Worker{Pool: pool, Registry: reg}

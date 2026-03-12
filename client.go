@@ -204,6 +204,106 @@ func GetRunOutputTx[O any](ctx context.Context, c Client, tx DBTX, runKey RunKey
 	return &out, nil
 }
 
+// ScheduleOption configures a ScheduleTx call.
+type ScheduleOption func(*scheduleOptions)
+
+type scheduleOptions struct {
+	runNow bool
+}
+
+// WithRunNow causes ScheduleTx to also create an immediate run in the same
+// transaction, in addition to setting up the recurring schedule.
+func WithRunNow() ScheduleOption {
+	return func(o *scheduleOptions) {
+		o.runNow = true
+	}
+}
+
+// ScheduleTx creates or updates a cron schedule in the database.
+//
+// Call this at any time — from an HTTP handler, a migration, or application
+// init code. The worker's cron loop polls the schedules table, so new or
+// updated rows are picked up automatically on the next tick.
+//
+// If a schedule with the same scheduleID already exists it is updated (the
+// input and cron expression are replaced, and next_run_at is recalculated if
+// the expression changed).
+//
+// Pass [WithRunNow] to also fire an immediate run in the same transaction.
+//
+// Go does not support type parameters on methods, so this is a package-level generic.
+func ScheduleTx[I any, O any](ctx context.Context, c Client, tx DBTX, wf Workflow[I, O], input *I, scheduleID string, schedule Schedule, opts ...ScheduleOption) error {
+	if wf == nil {
+		return fmt.Errorf("workflow is nil")
+	}
+	if scheduleID == "" {
+		scheduleID = wf.Name()
+	}
+	if schedule == nil {
+		return fmt.Errorf("schedule is nil")
+	}
+
+	var options scheduleOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	inputJSON, err := c.codec().Marshal(input)
+	if err != nil {
+		return fmt.Errorf("marshal input: %w", err)
+	}
+
+	expr := scheduleExpr(schedule)
+	now := c.now()
+	nextRun := schedule.Next(now)
+	t := c.tables()
+
+	_, err = tx.Exec(ctx, t.upsertScheduleSQL(),
+		scheduleID, wf.Name(), expr, inputJSON, nextRun, now,
+	)
+	if err != nil {
+		return fmt.Errorf("create schedule: %w", err)
+	}
+
+	if options.runNow {
+		runIDStr, err := newUUIDv7(now)
+		if err != nil {
+			return fmt.Errorf("generate run id: %w", err)
+		}
+		runID := RunID(runIDStr)
+		shard := workflowNameShard(wf.Name(), runID, c.DBConfig.shardCount())
+
+		_, err = tx.Exec(ctx, t.insertRunSQL(), shard, string(runID), wf.Name(), runStatusQueued, inputJSON)
+		if err != nil {
+			return fmt.Errorf("insert immediate run: %w", err)
+		}
+
+		_, _ = tx.Exec(ctx, "SELECT pg_notify($1, $2)", c.notifyChannel(), shard+":"+string(runID))
+	}
+
+	return nil
+}
+
+// DeleteScheduleTx permanently removes a cron schedule.
+//
+// Any runs that are already in progress are not affected.
+// Returns an error if the schedule is not found.
+func DeleteScheduleTx(ctx context.Context, c Client, tx DBTX, scheduleID string) error {
+	if scheduleID == "" {
+		return fmt.Errorf("scheduleID is empty")
+	}
+
+	t := c.tables()
+	result, err := tx.Exec(ctx, t.deleteScheduleSQL(), scheduleID)
+	if err != nil {
+		return fmt.Errorf("delete schedule: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("schedule not found: %s", scheduleID)
+	}
+	return nil
+}
+
 // PauseScheduleTx disables a cron schedule so it stops creating new runs.
 // The schedule row is preserved; call ResumeScheduleTx to re-enable it.
 // Returns an error if the schedule is not found.

@@ -55,6 +55,7 @@ func (s everySchedule) Next(after time.Time) time.Time {
 //   - If both day-of-month and day-of-week are restricted (not *),
 //     the schedule fires when EITHER matches.
 type CronSchedule struct {
+	expr    string // original 5-field expression for round-tripping
 	minute  cronField
 	hour    cronField
 	dom     cronField
@@ -63,6 +64,9 @@ type CronSchedule struct {
 	domStar bool // true when day-of-month field is unrestricted
 	dowStar bool // true when day-of-week field is unrestricted
 }
+
+// String returns the original 5-field cron expression.
+func (s *CronSchedule) String() string { return s.expr }
 
 // ParseCron parses a standard 5-field cron expression.
 //
@@ -114,6 +118,7 @@ func ParseCron(expr string) (Schedule, error) {
 	}
 
 	return &CronSchedule{
+		expr:    strings.Join(fields, " "),
 		minute:  minute,
 		hour:    hour,
 		dom:     dom,

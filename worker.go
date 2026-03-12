@@ -96,11 +96,6 @@ func (w *Worker) Run(ctx context.Context) error {
 		shardCount = 1
 	}
 
-	// Sync cron schedules to the database on startup.
-	if err := w.syncCronSchedules(ctx); err != nil {
-		return fmt.Errorf("sync cron schedules: %w", err)
-	}
-
 	// Set up LISTEN/NOTIFY for low-latency wakeups
 	notifyCh := make(chan struct{}, 1)
 	if !w.DisableNotify {
@@ -134,19 +129,18 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start cron loop if there are cron schedules registered.
-	if cronEntries := w.Registry.listCron(); len(cronEntries) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := w.runCronLoop(ctx, notifyCh); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
+	// Start cron loop unconditionally. It is a no-op when the schedules table
+	// is empty, and picks up schedules created at runtime via ScheduleTx.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := w.runCronLoop(ctx, notifyCh); err != nil {
+			select {
+			case errCh <- err:
+			default:
 			}
-		}()
-	}
+		}
+	}()
 
 	// Wait for context cancellation or error
 	select {
@@ -402,27 +396,6 @@ func (w *Worker) ProcessOne(ctx context.Context) (processed bool, err error) {
 
 // -- Cron schedule support ----------------------------------------------------
 
-// syncCronSchedules upserts all registered cron schedules into the database.
-// Called once during Worker.Run startup.
-func (w *Worker) syncCronSchedules(ctx context.Context) error {
-	entries := w.Registry.listCron()
-	if len(entries) == 0 {
-		return nil
-	}
-
-	t := newDBTables(w.DBConfig)
-	now := time.Now()
-
-	for _, e := range entries {
-		nextRun := e.schedule.Next(now)
-		_, err := w.Pool.Exec(ctx, t.upsertScheduleSQL(), e.scheduleID, e.workflowName, e.cronExpr, e.inputJSON, nextRun, now)
-		if err != nil {
-			return fmt.Errorf("upsert schedule %s: %w", e.scheduleID, err)
-		}
-	}
-	return nil
-}
-
 // runCronLoop periodically checks for due cron schedules and creates runs.
 func (w *Worker) runCronLoop(ctx context.Context, notifyCh chan<- struct{}) error {
 	for {
@@ -479,23 +452,11 @@ func (w *Worker) processOneCronSchedule(ctx context.Context, notifyCh chan<- str
 		return false, err
 	}
 
-	// Look up the schedule from the registry to compute next_run_at.
-	var sched Schedule
-	for _, e := range w.Registry.listCron() {
-		if e.scheduleID == scheduleID {
-			sched = e.schedule
-			break
-		}
-	}
-	if sched == nil {
-		// Schedule exists in DB but not in registry (possibly removed).
-		// Just advance it using the stored cron expression.
-		parsed, parseErr := ParseCron(cronExpr)
-		if parseErr != nil {
-			_ = tx.Rollback(ctx)
-			return false, fmt.Errorf("parse stored cron %q for schedule %s: %w", cronExpr, scheduleID, parseErr)
-		}
-		sched = parsed
+	// Parse the schedule from the stored cron expression.
+	sched, parseErr := ParseCron(cronExpr)
+	if parseErr != nil {
+		_ = tx.Rollback(ctx)
+		return false, fmt.Errorf("parse cron %q for schedule %s: %w", cronExpr, scheduleID, parseErr)
 	}
 
 	// Create the run.

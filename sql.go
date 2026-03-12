@@ -288,3 +288,7 @@ func (t dbTables) getScheduleEnabledSQL() string {
 		WHERE schedule_id = $1
 	`
 }
+
+func (t dbTables) deleteScheduleSQL() string {
+	return `DELETE FROM ` + t.schedules + ` WHERE schedule_id = $1`
+}
