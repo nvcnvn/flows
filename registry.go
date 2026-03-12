@@ -72,6 +72,18 @@ func WithConcurrency(n int) WorkflowOption {
 type Registry struct {
 	mu        sync.RWMutex
 	workflows map[string]workflowRunner
+
+	cronMu        sync.RWMutex
+	cronSchedules []cronEntry
+}
+
+// cronEntry holds a registered cron schedule.
+type cronEntry struct {
+	scheduleID   string
+	workflowName string
+	schedule     Schedule
+	cronExpr     string
+	inputJSON    []byte
 }
 
 func NewRegistry() *Registry {
@@ -136,4 +148,86 @@ func (r *Registry) list() []workflowRunner {
 		result = append(result, wf)
 	}
 	return result
+}
+
+// listCron returns all registered cron entries.
+func (r *Registry) listCron() []cronEntry {
+	r.cronMu.RLock()
+	defer r.cronMu.RUnlock()
+	out := make([]cronEntry, len(r.cronSchedules))
+	copy(out, r.cronSchedules)
+	return out
+}
+
+// RegisterCron registers a workflow with a cron schedule so the worker creates
+// runs automatically.
+//
+// The workflow must also be registered via [Register] (or the same call can be combined).
+// If it is not already registered, RegisterCron registers it with the given options.
+//
+// scheduleID uniquely identifies this schedule. Using the workflow name is a good default.
+// If empty, it defaults to wf.Name().
+//
+// Go does not support type parameters on methods, so this is a package-level generic.
+func RegisterCron[I any, O any](r *Registry, wf Workflow[I, O], input *I, scheduleID string, schedule Schedule, opts ...WorkflowOption) {
+	if err := registerCron(r, wf, input, scheduleID, schedule, opts...); err != nil {
+		panic(err)
+	}
+}
+
+func registerCron[I any, O any](r *Registry, wf Workflow[I, O], input *I, scheduleID string, schedule Schedule, opts ...WorkflowOption) error {
+	if wf == nil {
+		return fmt.Errorf("workflow is nil")
+	}
+	if r == nil {
+		return fmt.Errorf("registry is nil")
+	}
+	if schedule == nil {
+		return fmt.Errorf("schedule is nil")
+	}
+	if scheduleID == "" {
+		scheduleID = wf.Name()
+	}
+
+	// Ensure the workflow is registered (idempotent if already done).
+	_ = register(r, wf, opts...)
+
+	options := workflowOptions{
+		codec:       JSONCodec{},
+		concurrency: 1,
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	inputJSON, err := options.codec.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("marshal cron input: %w", err)
+	}
+
+	// Determine the cronExpr string for storage.
+	cronExpr := fmt.Sprintf("%v", schedule)
+	switch s := schedule.(type) {
+	case *CronSchedule:
+		cronExpr = fmt.Sprintf("%v", s)
+	case everySchedule:
+		cronExpr = "@every " + s.interval.String()
+	}
+
+	r.cronMu.Lock()
+	defer r.cronMu.Unlock()
+	// Check for duplicate schedule ID.
+	for _, e := range r.cronSchedules {
+		if e.scheduleID == scheduleID {
+			return fmt.Errorf("cron schedule already registered: %s", scheduleID)
+		}
+	}
+	r.cronSchedules = append(r.cronSchedules, cronEntry{
+		scheduleID:   scheduleID,
+		workflowName: wf.Name(),
+		schedule:     schedule,
+		cronExpr:     cronExpr,
+		inputJSON:    inputJSON,
+	})
+	return nil
 }

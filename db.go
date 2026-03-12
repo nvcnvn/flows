@@ -52,20 +52,22 @@ func (c DBConfig) shardCount() int {
 }
 
 type dbTables struct {
-	runs   string
-	steps  string
-	waits  string
-	events string
-	random string
+	runs      string
+	steps     string
+	waits     string
+	events    string
+	random    string
+	schedules string
 }
 
 func newDBTables(cfg DBConfig) dbTables {
 	schema := cfg.schema()
 	return dbTables{
-		runs:   pgx.Identifier{schema, "runs"}.Sanitize(),
-		steps:  pgx.Identifier{schema, "steps"}.Sanitize(),
-		waits:  pgx.Identifier{schema, "waits"}.Sanitize(),
-		events: pgx.Identifier{schema, "events"}.Sanitize(),
-		random: pgx.Identifier{schema, "random"}.Sanitize(),
+		runs:      pgx.Identifier{schema, "runs"}.Sanitize(),
+		steps:     pgx.Identifier{schema, "steps"}.Sanitize(),
+		waits:     pgx.Identifier{schema, "waits"}.Sanitize(),
+		events:    pgx.Identifier{schema, "events"}.Sanitize(),
+		random:    pgx.Identifier{schema, "random"}.Sanitize(),
+		schedules: pgx.Identifier{schema, "schedules"}.Sanitize(),
 	}
 }

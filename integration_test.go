@@ -145,6 +145,7 @@ func cleanupTables(t *testing.T, pool *pgxpool.Pool) {
 		"waits",
 		"steps",
 		"runs",
+		"schedules",
 	}
 	schema := flows.DefaultSchema
 
@@ -3102,4 +3103,288 @@ func TestGetRunOutput(t *testing.T) {
 	}
 
 	t.Logf("GetRunOutput test passed: %s", output.Greeting)
+}
+
+// =============================================================================
+// Worker Resilience Tests
+// =============================================================================
+
+// TestWorkerResilience_ContinuesAfterTransientError verifies that the Worker.Run
+// loop does NOT terminate when a transient DB error occurs. Before the fix, any
+// error from processOneForWorkflow propagated to runWorkflowLoop, which caused
+// Worker.Run to return — killing all goroutine pools permanently.
+//
+// This test demonstrates the fix by:
+//  1. Starting a worker with a long poll interval
+//  2. Dropping and recreating the schema mid-flight to cause a transient error
+//  3. Verifying the worker recovers and processes a subsequently-enqueued run
+func TestWorkerResilience_ContinuesAfterTransientError(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := flows.NewRegistry()
+	wf := &SimpleWorkflow{}
+	flows.Register(registry, wf)
+
+	worker := &flows.Worker{
+		Pool:          pool,
+		Registry:      registry,
+		PollInterval:  50 * time.Millisecond,
+		DisableNotify: true,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(ctx)
+	}()
+
+	// Give the worker time to start polling.
+	time.Sleep(100 * time.Millisecond)
+
+	// Drop and recreate the schema to cause a transient error in the worker.
+	_, err := pool.Exec(ctx, "DROP SCHEMA "+flows.DefaultSchema+" CASCADE")
+	if err != nil {
+		t.Fatalf("Failed to drop schema: %v", err)
+	}
+
+	// The worker's next poll will hit an error (tables gone). Wait for it to encounter the error.
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify the worker is still running (errCh should be empty).
+	select {
+	case err := <-errCh:
+		t.Fatalf("Worker terminated unexpectedly (before fix this would happen): %v", err)
+	default:
+		// Good: worker is still alive
+	}
+
+	// Recreate the schema so the worker can function again.
+	if _, err := pool.Exec(ctx, flows.SchemaSQL); err != nil {
+		t.Fatalf("Failed to recreate schema: %v", err)
+	}
+	if _, err := pool.Exec(ctx, flows.CitusSchemaSQL); err != nil {
+		t.Fatalf("Failed to recreate Citus tables: %v", err)
+	}
+
+	// Enqueue a run and verify the worker processes it.
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+	runKey, err := flows.BeginTx(ctx, client, tx, wf, &SimpleInput{Name: "AfterRecovery"})
+	if err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("Failed to start run: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	waitForRunStatus(t, pool, runKey, "completed", 2*time.Second)
+
+	cancel()
+	workerErr := <-errCh
+	if workerErr != nil && !errors.Is(workerErr, context.Canceled) {
+		t.Fatalf("Worker returned unexpected error: %v", workerErr)
+	}
+}
+
+// =============================================================================
+// Cron Schedule Tests
+// =============================================================================
+
+// CronWorkflow is a simple workflow used for cron schedule testing.
+type CronWorkflow struct {
+	Executions atomic.Int32
+}
+
+type CronInput struct {
+	Tag string `json:"tag"`
+}
+
+type CronOutput struct {
+	Tag     string `json:"tag"`
+	ExecNum int    `json:"exec_num"`
+}
+
+func (w *CronWorkflow) Name() string { return "cron_workflow" }
+
+func (w *CronWorkflow) Run(ctx context.Context, wf *flows.Context, in *CronInput) (*CronOutput, error) {
+	n := int(w.Executions.Add(1))
+	return &CronOutput{Tag: in.Tag, ExecNum: n}, nil
+}
+
+// TestCronSchedule_CreatesRuns verifies the cron scheduler creates runs automatically.
+func TestCronSchedule_CreatesRuns(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+
+	// Register with a very short interval so the test completes quickly.
+	flows.RegisterCron(registry, wf, &CronInput{Tag: "cron-test"}, "", flows.Every(100*time.Millisecond))
+
+	worker := &flows.Worker{
+		Pool:          pool,
+		Registry:      registry,
+		PollInterval:  50 * time.Millisecond,
+		DisableNotify: true,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(ctx)
+	}()
+
+	// Wait enough time for at least 3 cron-triggered runs to complete.
+	time.Sleep(500 * time.Millisecond)
+
+	cancel()
+	err := <-errCh
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Worker error: %v", err)
+	}
+
+	executions := wf.Executions.Load()
+	if executions < 3 {
+		t.Errorf("Expected at least 3 cron executions, got %d", executions)
+	}
+
+	// Verify runs exist in the database.
+	var runCount int
+	pool.QueryRow(context.Background(),
+		"SELECT COUNT(*) FROM flows.runs WHERE workflow_name = 'cron_workflow' AND status = 'completed'",
+	).Scan(&runCount)
+	if runCount < 3 {
+		t.Errorf("Expected at least 3 completed cron runs in DB, got %d", runCount)
+	}
+
+	// Verify the schedule was advanced.
+	var lastRunAt *time.Time
+	var nextRunAt time.Time
+	pool.QueryRow(context.Background(),
+		"SELECT last_run_at, next_run_at FROM flows.schedules WHERE schedule_id = 'cron_workflow'",
+	).Scan(&lastRunAt, &nextRunAt)
+	if lastRunAt == nil {
+		t.Error("Expected last_run_at to be set after cron executions")
+	}
+	if nextRunAt.IsZero() {
+		t.Error("Expected next_run_at to be set")
+	}
+
+	t.Logf("Cron test: %d executions, %d completed runs", executions, runCount)
+}
+
+// TestCronSchedule_CronExpr verifies standard cron expression scheduling.
+func TestCronSchedule_CronExpr(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+
+	// Register with a cron expression. We'll manipulate next_run_at directly
+	// to test that the worker picks it up.
+	flows.RegisterCron(registry, wf, &CronInput{Tag: "cron-expr"}, "", flows.MustParseCron("*/5 * * * *"))
+
+	worker := &flows.Worker{
+		Pool:          pool,
+		Registry:      registry,
+		PollInterval:  50 * time.Millisecond,
+		DisableNotify: true,
+	}
+
+	// Sync schedules first.
+	// We need to make the schedule "due" by backdating next_run_at.
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(workerCtx)
+	}()
+
+	// Give time for sync and processing.
+	time.Sleep(100 * time.Millisecond)
+
+	// Backdate next_run_at so the schedule appears due.
+	_, err := pool.Exec(ctx,
+		"UPDATE flows.schedules SET next_run_at = now() - interval '1 minute' WHERE schedule_id = 'cron_workflow'")
+	if err != nil {
+		t.Fatalf("Failed to backdate schedule: %v", err)
+	}
+
+	// Wait for the worker to process the due schedule.
+	time.Sleep(300 * time.Millisecond)
+
+	cancel()
+	workerErr := <-errCh
+	if workerErr != nil && !errors.Is(workerErr, context.Canceled) {
+		t.Fatalf("Worker error: %v", workerErr)
+	}
+
+	// Verify at least one cron run was created and completed.
+	executions := wf.Executions.Load()
+	if executions < 1 {
+		t.Errorf("Expected at least 1 cron execution, got %d", executions)
+	}
+
+	t.Logf("Cron expression test: %d executions", executions)
+}
+
+// TestCronSchedule_MultipleWorkers verifies that only one worker creates a
+// cron run per schedule tick, using FOR UPDATE SKIP LOCKED.
+func TestCronSchedule_MultipleWorkers(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+	flows.RegisterCron(registry, wf, &CronInput{Tag: "multi-worker"}, "", flows.Every(80*time.Millisecond))
+
+	numWorkers := 3
+	errChs := make([]chan error, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		errChs[i] = make(chan error, 1)
+		worker := &flows.Worker{
+			Pool:          pool,
+			Registry:      registry,
+			PollInterval:  30 * time.Millisecond,
+			DisableNotify: true,
+		}
+		ch := errChs[i]
+		go func() {
+			ch <- worker.Run(ctx)
+		}()
+	}
+
+	// Let them run for a while.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+
+	for i, ch := range errChs {
+		err := <-ch
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Worker %d error: %v", i, err)
+		}
+	}
+
+	// Each cron tick should produce exactly one run, not N (one per worker).
+	var runCount int
+	pool.QueryRow(context.Background(),
+		"SELECT COUNT(*) FROM flows.runs WHERE workflow_name = 'cron_workflow'",
+	).Scan(&runCount)
+
+	// With 80ms interval over 500ms, we expect ~6 runs. With some variance,
+	// at minimum 3 and at most 10 is reasonable.
+	if runCount < 3 || runCount > 10 {
+		t.Errorf("Expected 3-10 cron runs (parallel safety), got %d", runCount)
+	}
+
+	t.Logf("Multi-worker cron test: %d runs from %d workers", runCount, numWorkers)
 }

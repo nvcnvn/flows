@@ -96,6 +96,11 @@ func (w *Worker) Run(ctx context.Context) error {
 		shardCount = 1
 	}
 
+	// Sync cron schedules to the database on startup.
+	if err := w.syncCronSchedules(ctx); err != nil {
+		return fmt.Errorf("sync cron schedules: %w", err)
+	}
+
 	// Set up LISTEN/NOTIFY for low-latency wakeups
 	notifyCh := make(chan struct{}, 1)
 	if !w.DisableNotify {
@@ -127,6 +132,20 @@ func (w *Worker) Run(ctx context.Context) error {
 				}
 			}(workflowName, state)
 		}
+	}
+
+	// Start cron loop if there are cron schedules registered.
+	if cronEntries := w.Registry.listCron(); len(cronEntries) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := w.runCronLoop(ctx, notifyCh); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+		}()
 	}
 
 	// Wait for context cancellation or error
@@ -195,11 +214,25 @@ func (w *Worker) listenLoop(ctx context.Context, notifyCh chan<- struct{}) {
 // runWorkflowLoop processes runs for a specific workflow type.
 // It iterates through all shards to find work, using round-robin rotation
 // to prevent starvation when some shards have more work.
+//
+// Transient database errors (connection drops, timeouts) are retried with
+// backoff rather than killing the worker. Only context cancellation causes
+// the loop to exit.
 func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state *workflowState, notifyCh <-chan struct{}) error {
 	for {
 		processed, err := w.processOneForWorkflow(ctx, workflowName, state)
 		if err != nil {
-			return err
+			// Context cancellation is the only reason to stop the loop.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Transient error: back off and retry.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(w.pollInterval()):
+			}
+			continue
 		}
 		if processed {
 			continue
@@ -365,4 +398,141 @@ func (w *Worker) ProcessOne(ctx context.Context) (processed bool, err error) {
 		}
 	}
 	return false, nil
+}
+
+// -- Cron schedule support ----------------------------------------------------
+
+// syncCronSchedules upserts all registered cron schedules into the database.
+// Called once during Worker.Run startup.
+func (w *Worker) syncCronSchedules(ctx context.Context) error {
+	entries := w.Registry.listCron()
+	if len(entries) == 0 {
+		return nil
+	}
+
+	t := newDBTables(w.DBConfig)
+	now := time.Now()
+
+	for _, e := range entries {
+		nextRun := e.schedule.Next(now)
+		_, err := w.Pool.Exec(ctx, t.upsertScheduleSQL(), e.scheduleID, e.workflowName, e.cronExpr, e.inputJSON, nextRun, now)
+		if err != nil {
+			return fmt.Errorf("upsert schedule %s: %w", e.scheduleID, err)
+		}
+	}
+	return nil
+}
+
+// runCronLoop periodically checks for due cron schedules and creates runs.
+func (w *Worker) runCronLoop(ctx context.Context, notifyCh chan<- struct{}) error {
+	for {
+		created, err := w.processOneCronSchedule(ctx, notifyCh)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Transient error: back off and retry.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(w.pollInterval()):
+			}
+			continue
+		}
+		if created {
+			// Processed one; check for more immediately.
+			continue
+		}
+
+		// No due schedules; wait.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(w.pollInterval()):
+		}
+	}
+}
+
+// processOneCronSchedule claims one due schedule, creates a run, and advances next_run_at.
+func (w *Worker) processOneCronSchedule(ctx context.Context, notifyCh chan<- struct{}) (bool, error) {
+	t := newDBTables(w.DBConfig)
+
+	tx, err := w.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var scheduleID, workflowName, cronExpr string
+	var inputJSON []byte
+
+	err = tx.QueryRow(ctx, t.claimDueScheduleSQL()).Scan(&scheduleID, &workflowName, &cronExpr, &inputJSON)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			_ = tx.Rollback(ctx)
+			return false, nil
+		}
+		return false, err
+	}
+
+	// Look up the schedule from the registry to compute next_run_at.
+	var sched Schedule
+	for _, e := range w.Registry.listCron() {
+		if e.scheduleID == scheduleID {
+			sched = e.schedule
+			break
+		}
+	}
+	if sched == nil {
+		// Schedule exists in DB but not in registry (possibly removed).
+		// Just advance it using the stored cron expression.
+		parsed, parseErr := ParseCron(cronExpr)
+		if parseErr != nil {
+			_ = tx.Rollback(ctx)
+			return false, fmt.Errorf("parse stored cron %q for schedule %s: %w", cronExpr, scheduleID, parseErr)
+		}
+		sched = parsed
+	}
+
+	// Create the run.
+	now := time.Now()
+	runIDStr, err := newUUIDv7(now)
+	if err != nil {
+		return false, fmt.Errorf("generate run id: %w", err)
+	}
+	runID := RunID(runIDStr)
+
+	shardCount := w.DBConfig.shardCount()
+	shard := workflowNameShard(workflowName, runID, shardCount)
+
+	_, err = tx.Exec(ctx, t.insertRunSQL(), shard, string(runID), workflowName, runStatusQueued, inputJSON)
+	if err != nil {
+		return false, fmt.Errorf("insert cron run: %w", err)
+	}
+
+	// Advance the schedule.
+	nextRun := sched.Next(now)
+	_, err = tx.Exec(ctx, t.advanceScheduleSQL(), scheduleID, nextRun, now)
+	if err != nil {
+		return false, fmt.Errorf("advance schedule %s: %w", scheduleID, err)
+	}
+
+	err = tx.Commit(ctx)
+	if err != nil {
+		return false, fmt.Errorf("commit cron run: %w", err)
+	}
+
+	// Hint workflow workers that a new run is available.
+	ch := w.notifyChannel()
+	_, _ = w.Pool.Exec(ctx, "SELECT pg_notify($1, $2)", ch, shard+":"+string(runID))
+	select {
+	case notifyCh <- struct{}{}:
+	default:
+	}
+
+	return true, nil
 }

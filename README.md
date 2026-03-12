@@ -148,6 +148,66 @@ result, err := flows.Execute(ctx, wf, "step/v1", stepFn, in, flows.RetryPolicy{
 
 **Workflow Panic Recovery**: If the workflow function itself panics (outside of `Execute`), the worker catches the panic, marks the run as `failed`, and persists a stack trace in `runs.error_text`.
 
+## Cron Schedules
+
+Flows supports automatic, recurring workflow runs via cron schedules. Instead of
+calling `flows.BeginTx` explicitly, you register a cron schedule and the worker
+creates runs on the configured cadence.
+
+### How it works
+
+1. **Registration**: At startup you call `flows.RegisterCron` to associate a
+   workflow + input + schedule. This also registers the workflow if it isn't
+   already.
+2. **Sync**: When `worker.Run(ctx)` starts, it upserts every registered schedule
+   into a `schedules` table (next fire time, cron expression, input JSON). If the
+   cron expression hasn't changed since the last deploy, the existing
+   `next_run_at` is preserved; if the expression changed, it's recalculated.
+3. **Polling**: A dedicated cron goroutine polls for schedules whose
+   `next_run_at <= now()`. It claims a row with `FOR UPDATE SKIP LOCKED`
+   (same pattern as workflow runs), inserts a new run, and advances
+   `next_run_at`—all in one transaction.
+4. **Execution**: The new run is picked up by the normal workflow worker loop.
+
+Multiple workers share the same `schedules` table. `FOR UPDATE SKIP LOCKED`
+guarantees exactly one worker fires each schedule tick, so no duplicate runs.
+
+### Schedules
+
+Two schedule types are built-in:
+
+| Type | Constructor | Example |
+|------|-------------|---------|
+| Fixed interval | `flows.Every(d)` | `flows.Every(5 * time.Minute)` |
+| Cron expression | `flows.MustParseCron(expr)` | `flows.MustParseCron("*/10 * * * *")` |
+
+The cron parser supports standard 5-field syntax
+(`minute hour day-of-month month day-of-week`) with `*`, `N`, `N-M`, `N,M`,
+`*/N`, `N-M/S`, and `@every <duration>`. Day-of-week uses 0=Sunday (7 also accepted).
+
+### Quick start
+
+```go
+reg := flows.NewRegistry()
+
+// Register a cron that runs myWorkflow every 5 minutes with a fixed input.
+flows.RegisterCron(reg, myWorkflow, &MyInput{Value: "cron"}, "my-schedule", flows.Every(5*time.Minute))
+
+// Or use a standard cron expression (every day at 02:30 UTC):
+flows.RegisterCron(reg, myWorkflow, &MyInput{Value: "nightly"}, "nightly-job", flows.MustParseCron("30 2 * * *"))
+
+worker := flows.Worker{Pool: pool, Registry: reg}
+_ = worker.Run(ctx)
+```
+
+The schedule ID (`"my-schedule"` above) uniquely identifies the schedule row.
+Use a stable string (e.g. the workflow name) so the row survives redeploys.
+If you omit the schedule ID (empty string), it defaults to `wf.Name()`.
+
+### Example
+
+See [examples/cron/example.go](examples/cron/example.go) for a complete runnable example.
+
 ## Stress test
 
 See [examples/stress/README.md](examples/stress/README.md) for a repeatable stress harness that:

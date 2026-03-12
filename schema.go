@@ -105,6 +105,18 @@ CREATE TABLE IF NOT EXISTS %s (
 		REFERENCES %s(workflow_name_shard, run_id)
 		ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS %s (
+	schedule_id    text NOT NULL PRIMARY KEY,
+	workflow_name  text NOT NULL,
+	cron_expr      text NOT NULL,
+	input_json     jsonb NOT NULL,
+	enabled        boolean NOT NULL DEFAULT true,
+	last_run_at    timestamptz,
+	next_run_at    timestamptz NOT NULL,
+	created_at     timestamptz NOT NULL DEFAULT now(),
+	updated_at     timestamptz NOT NULL DEFAULT now()
+);
 `,
 		schemaIdent,
 		t.runs,
@@ -118,6 +130,7 @@ CREATE TABLE IF NOT EXISTS %s (
 		t.runs,
 		t.random,
 		t.runs,
+		t.schedules,
 	)
 }
 
@@ -142,6 +155,8 @@ func CitusSchemaSQLFor(schema string) string {
 	events := schema + ".events"
 	random := schema + ".random"
 
+	schedules := schema + ".schedules"
+
 	return fmt.Sprintf(`
 -- Distribute the runs table by workflow_name_shard
 SELECT create_distributed_table('%s', 'workflow_name_shard');
@@ -151,12 +166,17 @@ SELECT create_distributed_table('%s', 'workflow_name_shard', colocate_with => '%
 SELECT create_distributed_table('%s', 'workflow_name_shard', colocate_with => '%s');
 SELECT create_distributed_table('%s', 'workflow_name_shard', colocate_with => '%s');
 SELECT create_distributed_table('%s', 'workflow_name_shard', colocate_with => '%s');
+
+-- Schedules is a reference table (replicated to all nodes) because it is
+-- not sharded by workflow_name_shard and is small (one row per cron schedule).
+SELECT create_reference_table('%s');
 `,
 		runs,
 		steps, runs,
 		waits, runs,
 		events, runs,
 		random, runs,
+		schedules,
 	)
 }
 

@@ -230,3 +230,44 @@ func (t dbTables) setRunCompletedSQL() string {
 		SET status = $3, output_json = $4, error_text = NULL, next_wake_at = NULL, updated_at = now()
 		WHERE workflow_name_shard = $1 AND run_id = $2`
 }
+
+// -- Schedule SQL --
+
+func (t dbTables) upsertScheduleSQL() string {
+	return `
+		INSERT INTO ` + t.schedules + ` (schedule_id, workflow_name, cron_expr, input_json, enabled, next_run_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, true, $5, $6, $6)
+		ON CONFLICT (schedule_id) DO UPDATE
+		SET workflow_name = EXCLUDED.workflow_name,
+			cron_expr = EXCLUDED.cron_expr,
+			input_json = EXCLUDED.input_json,
+			enabled = EXCLUDED.enabled,
+			next_run_at = CASE
+				WHEN ` + t.schedules + `.cron_expr != EXCLUDED.cron_expr THEN EXCLUDED.next_run_at
+				ELSE ` + t.schedules + `.next_run_at
+			END,
+			updated_at = EXCLUDED.updated_at
+	`
+}
+
+func (t dbTables) claimDueScheduleSQL() string {
+	return `
+		SELECT schedule_id, workflow_name, cron_expr, input_json
+		FROM ` + t.schedules + `
+		WHERE enabled = true
+		  AND next_run_at <= now()
+		ORDER BY next_run_at
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`
+}
+
+func (t dbTables) advanceScheduleSQL() string {
+	return `
+		UPDATE ` + t.schedules + `
+		SET last_run_at = $3,
+			next_run_at = $2,
+			updated_at = $3
+		WHERE schedule_id = $1
+	`
+}
