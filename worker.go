@@ -20,8 +20,9 @@ import (
 // - status = 'queued', or
 // - status = 'sleeping' and next_wake_at <= now().
 //
-// Each registered workflow type runs in its own goroutine pool with configurable
-// concurrency. This ensures busy workflows don't block other workflow types.
+// Each registered workflow type uses one dispatcher goroutine plus a bounded
+// executor pool with configurable concurrency. This ensures busy workflows
+// don't block other workflow types while avoiding duplicated DB polling.
 //
 // # Citus Compatibility
 //
@@ -62,6 +63,14 @@ type Worker struct {
 type workflowState struct {
 	shards  []string // all shard values for this workflow
 	shardRR uint64   // round-robin counter for shard rotation
+}
+
+type claimedRun struct {
+	runner    workflowRunner
+	shard     string
+	runID     string
+	inputJSON []byte
+	tx        pgx.Tx
 }
 
 type idleBackoff struct {
@@ -127,12 +136,9 @@ func (w *Worker) notifyChannel() string {
 }
 
 // Run starts the worker and blocks until ctx is cancelled.
-// Each registered workflow type runs in its own goroutine pool based on its
-// configured concurrency. This ensures busy workflows don't block other types.
-//
-// Within each workflow's pool, workers iterate through all shards (workflow_name_shard values)
-// to find work. This is required for Citus compatibility where FOR UPDATE SKIP LOCKED
-// must be routed to a single shard.
+// Each registered workflow type gets one dispatcher goroutine that claims work
+// from Postgres and a bounded in-process executor pool that runs claimed work.
+// This preserves per-workflow concurrency without multiplying DB polling.
 func (w *Worker) Run(ctx context.Context) error {
 	if w.Pool == nil {
 		return errors.New("flows: Worker.Pool is required")
@@ -161,28 +167,44 @@ func (w *Worker) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
 
-	// Start a goroutine pool for each workflow type
+	// Start one dispatcher plus an executor pool for each workflow type.
 	for _, runner := range workflows {
 		concurrency := runner.concurrency()
-		workflowName := runner.workflowName()
 
-		// Create shared state for this workflow's goroutines
+		// Create shared state for this workflow's dispatcher.
 		state := &workflowState{
-			shards: ShardValuesForWorkflow(workflowName, shardCount),
+			shards: ShardValuesForWorkflow(runner.workflowName(), shardCount),
+		}
+		jobCh := make(chan claimedRun, concurrency)
+		slots := make(chan struct{}, concurrency)
+		for i := 0; i < concurrency; i++ {
+			slots <- struct{}{}
 		}
 
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
-			go func(name string, st *workflowState) {
+			go func() {
 				defer wg.Done()
-				if err := w.runWorkflowLoop(ctx, name, st, runNotifyCh); err != nil {
+				if err := w.runWorkflowExecutor(ctx, jobCh, slots); err != nil {
 					select {
 					case errCh <- err:
 					default:
 					}
 				}
-			}(workflowName, state)
+			}()
 		}
+
+		wg.Add(1)
+		go func(r workflowRunner, st *workflowState) {
+			defer wg.Done()
+			defer close(jobCh)
+			if err := w.runWorkflowDispatcher(ctx, r, st, runNotifyCh, jobCh, slots); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+		}(runner, state)
 	}
 
 	// Start cron loop unconditionally. It is a no-op when the schedules table
@@ -267,18 +289,20 @@ func (w *Worker) listenLoop(ctx context.Context, runNotifyCh chan<- struct{}, sc
 	}
 }
 
-// runWorkflowLoop processes runs for a specific workflow type.
-// It iterates through all shards to find work, using round-robin rotation
-// to prevent starvation when some shards have more work.
-//
-// Transient database errors (connection drops, timeouts) are retried with
-// backoff rather than killing the worker. Only context cancellation causes
-// the loop to exit.
-func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state *workflowState, notifyCh <-chan struct{}) error {
+// runWorkflowDispatcher claims runs for a specific workflow type and hands them
+// to the executor pool. Only this loop polls Postgres for that workflow.
+func (w *Worker) runWorkflowDispatcher(ctx context.Context, runner workflowRunner, state *workflowState, notifyCh <-chan struct{}, jobCh chan<- claimedRun, slots chan struct{}) error {
 	idle := newIdleBackoff(w.pollInterval(), w.maxPollInterval())
 	for {
-		processed, err := w.processOneForWorkflow(ctx, workflowName, state)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-slots:
+		}
+
+		job, claimed, err := w.claimOneForWorkflow(ctx, runner, state)
 		if err != nil {
+			slots <- struct{}{}
 			// Context cancellation is the only reason to stop the loop.
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -292,10 +316,18 @@ func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state
 			}
 			continue
 		}
-		if processed {
+		if claimed {
 			idle.reset()
+			select {
+			case <-ctx.Done():
+				_ = job.tx.Rollback(ctx)
+				slots <- struct{}{}
+				return ctx.Err()
+			case jobCh <- job:
+			}
 			continue
 		}
+		slots <- struct{}{}
 
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -313,44 +345,60 @@ func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state
 	}
 }
 
-// processOneForWorkflow claims and executes one run for a specific workflow type.
+// runWorkflowExecutor executes claimed runs for a specific workflow type.
+func (w *Worker) runWorkflowExecutor(ctx context.Context, jobCh <-chan claimedRun, slots chan<- struct{}) error {
+	for job := range jobCh {
+		err := w.executeClaimedRun(ctx, job)
+		slots <- struct{}{}
+		if err != nil {
+			if ctx.Err() != nil {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// claimOneForWorkflow claims at most one run for a specific workflow type.
 // It iterates through all shards for the workflow, starting from a rotating position
 // to ensure fair distribution of work across shards.
 //
 // On Citus, the query must include workflow_name_shard in the WHERE clause
 // so that FOR UPDATE SKIP LOCKED is routed to a single shard.
-func (w *Worker) processOneForWorkflow(ctx context.Context, workflowName string, state *workflowState) (processed bool, err error) {
+func (w *Worker) claimOneForWorkflow(ctx context.Context, runner workflowRunner, state *workflowState) (job claimedRun, claimed bool, err error) {
+	workflowName := runner.workflowName()
 	shards := state.shards
 	if len(shards) == 0 {
-		return false, nil
+		return claimedRun{}, false, nil
 	}
 
 	// Single shard - no rotation needed
 	if len(shards) == 1 {
-		return w.processOneShard(ctx, workflowName, shards[0])
+		return w.claimOneShard(ctx, runner, workflowName, shards[0])
 	}
 
 	// Multiple shards - rotate starting position to prevent starvation
 	start := int(atomic.AddUint64(&state.shardRR, 1) % uint64(len(shards)))
 	for i := 0; i < len(shards); i++ {
 		shard := shards[(start+i)%len(shards)]
-		processed, err = w.processOneShard(ctx, workflowName, shard)
-		if err != nil || processed {
-			return processed, err
+		job, claimed, err = w.claimOneShard(ctx, runner, workflowName, shard)
+		if err != nil || claimed {
+			return job, claimed, err
 		}
 	}
-	return false, nil
+	return claimedRun{}, false, nil
 }
 
-// processOneShard claims and executes one run from a specific shard.
+// claimOneShard claims one run from a specific shard and marks it running.
 // The shard value (workflow_name_shard) is included in the WHERE clause
 // to ensure Citus routes the query to a single node.
-func (w *Worker) processOneShard(ctx context.Context, workflowName, shard string) (processed bool, err error) {
+func (w *Worker) claimOneShard(ctx context.Context, runner workflowRunner, workflowName, shard string) (job claimedRun, claimed bool, err error) {
 	t := newDBTables(w.DBConfig)
 
 	tx, err := w.Pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return claimedRun{}, false, err
 	}
 	defer func() {
 		if err != nil {
@@ -368,7 +416,7 @@ func (w *Worker) processOneShard(ctx context.Context, workflowName, shard string
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = tx.Rollback(ctx)
-			return false, nil
+			return claimedRun{}, false, nil
 		}
 
 		// If the schema/tables haven't been created yet, don't crash the worker.
@@ -376,25 +424,36 @@ func (w *Worker) processOneShard(ctx context.Context, workflowName, shard string
 		if errors.As(err, &pgErr) {
 			if pgErr.Code == "3F000" || pgErr.Code == "42P01" {
 				_ = tx.Rollback(ctx)
-				return false, nil
+				return claimedRun{}, false, nil
 			}
 		}
-		return false, err
+		return claimedRun{}, false, err
 	}
 
 	_, err = tx.Exec(ctx, t.setRunRunningSQL(), shard, runID, runStatusRunning)
 	if err != nil {
-		return false, err
+		return claimedRun{}, false, err
 	}
 
-	runner, ok := w.Registry.get(workflowName)
-	if !ok {
-		_, _ = tx.Exec(ctx, t.setRunFailedSQL(), shard, runID, runStatusFailed, "workflow not registered: "+workflowName)
-		err = tx.Commit(ctx)
-		return true, err
-	}
+	return claimedRun{
+		runner:    runner,
+		shard:     shard,
+		runID:     runID,
+		inputJSON: inputJSON,
+		tx:        tx,
+	}, true, nil
+}
 
-	wfCtx := newContext(RunKey{WorkflowNameShard: shard, RunID: RunID(runID)}, tx, runner.codec(), t)
+func (w *Worker) executeClaimedRun(ctx context.Context, job claimedRun) (err error) {
+	t := newDBTables(w.DBConfig)
+	tx := job.tx
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	wfCtx := newContext(RunKey{WorkflowNameShard: job.shard, RunID: RunID(job.runID)}, tx, job.runner.codec(), t)
 
 	// Run the workflow, catching durable yields.
 	var outputJSON []byte
@@ -412,30 +471,30 @@ func (w *Worker) processOneShard(ctx context.Context, workflowName, shard string
 			}
 		}()
 
-		outputJSON, runErr = runner.run(ctx, wfCtx, inputJSON)
+		outputJSON, runErr = job.runner.run(ctx, wfCtx, job.inputJSON)
 	}()
 
 	if runErr != nil {
 		if _, ok := runErr.(yieldPanic); ok {
 			err = tx.Commit(ctx)
-			return true, err
+			return err
 		}
 
-		_, _ = tx.Exec(ctx, t.setRunFailedSQL(), shard, runID, runStatusFailed, runErr.Error())
+		_, _ = tx.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error())
 		err = tx.Commit(ctx)
-		return true, err
+		return err
 	}
 
-	_, err = tx.Exec(ctx, t.setRunCompletedSQL(), shard, runID, runStatusCompleted, outputJSON)
+	_, err = tx.Exec(ctx, t.setRunCompletedSQL(), job.shard, job.runID, runStatusCompleted, outputJSON)
 	if err != nil {
-		return false, fmt.Errorf("persist run output: %w", err)
+		return fmt.Errorf("persist run output: %w", err)
 	}
 
 	err = tx.Commit(ctx)
 	if err != nil {
-		return false, fmt.Errorf("commit workflow run %s: %w", runID, err)
+		return fmt.Errorf("commit workflow run %s: %w", job.runID, err)
 	}
-	return true, nil
+	return nil
 }
 
 // ProcessOne claims and executes at most one runnable run from any registered workflow.
@@ -449,13 +508,16 @@ func (w *Worker) ProcessOne(ctx context.Context) (processed bool, err error) {
 
 	workflows := w.Registry.list()
 	for _, runner := range workflows {
-		workflowName := runner.workflowName()
-		shards := ShardValuesForWorkflow(workflowName, shardCount)
-		for _, shard := range shards {
-			processed, err = w.processOneShard(ctx, workflowName, shard)
-			if err != nil || processed {
-				return processed, err
+		state := &workflowState{shards: ShardValuesForWorkflow(runner.workflowName(), shardCount)}
+		job, claimed, err := w.claimOneForWorkflow(ctx, runner, state)
+		if err != nil {
+			return false, err
+		}
+		if claimed {
+			if err := w.executeClaimedRun(ctx, job); err != nil {
+				return true, err
 			}
+			return true, nil
 		}
 	}
 	return false, nil

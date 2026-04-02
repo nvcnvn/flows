@@ -60,8 +60,9 @@ type RunKey struct {
 
 ### Worker concurrency
 
-Each workflow type runs in its own goroutine pool with configurable concurrency.
-This ensures busy workflows don't block other workflow types.
+Each workflow type uses one dispatcher goroutine to claim work from Postgres
+and a bounded executor pool with configurable concurrency. This ensures busy
+workflows don't block other workflow types without multiplying shard scans.
 
 ```go
 reg := flows.NewRegistry()
@@ -69,7 +70,7 @@ flows.Register(reg, myFastWorkflow)  // default concurrency: 1
 flows.Register(reg, mySlowWorkflow, flows.WithConcurrency(10))  // 10 goroutines
 
 worker := flows.Worker{Pool: pool, Registry: reg, DBConfig: flows.DBConfig{ShardCount: 32}}
-worker.Run(ctx)  // starts goroutine pools for each workflow type
+worker.Run(ctx)  // starts one dispatcher + executor pool per workflow type
 ```
 
 When LISTEN/NOTIFY is enabled, `PollInterval` is the base idle/retry delay and
