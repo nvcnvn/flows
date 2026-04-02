@@ -1,9 +1,23 @@
 package flows
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type noopWorkflow struct {
+	name string
+}
+
+func (w noopWorkflow) Name() string { return w.name }
+
+func (w noopWorkflow) Run(ctx context.Context, wf *Context, in *struct{}) (*struct{}, error) {
+	return &struct{}{}, nil
+}
 
 func TestIdleBackoffSequence(t *testing.T) {
 	b := newIdleBackoff(250*time.Millisecond, 2*time.Second)
@@ -56,4 +70,59 @@ func TestWorkerMaxPollInterval(t *testing.T) {
 			t.Fatalf("maxPollInterval() = %v, want %v", got, 2*time.Second)
 		}
 	})
+}
+
+func TestWorkerDispatcherClaimVolumeStaysFlatAcrossConcurrency(t *testing.T) {
+	run := func(t *testing.T, concurrency int) int64 {
+		t.Helper()
+
+		registry := NewRegistry()
+		Register(registry, noopWorkflow{name: "noop"}, WithConcurrency(concurrency))
+
+		var attempts atomic.Int64
+		worker := &Worker{
+			Pool:            &pgxpool.Pool{},
+			Registry:        registry,
+			PollInterval:    5 * time.Millisecond,
+			DisableNotify:   true,
+			disableCronLoop: true,
+			onClaimAttempt: func(workflowName string) {
+				attempts.Add(1)
+			},
+			claimOneForWorkflowFunc: func(ctx context.Context, runner workflowRunner, state *workflowState) (claimedRun, bool, error) {
+				return claimedRun{}, false, nil
+			},
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- worker.Run(ctx)
+		}()
+
+		time.Sleep(60 * time.Millisecond)
+		cancel()
+
+		err := <-errCh
+		if err != nil && err != context.Canceled {
+			t.Fatalf("worker returned error: %v", err)
+		}
+
+		return attempts.Load()
+	}
+
+	one := run(t, 1)
+	eight := run(t, 8)
+
+	if one == 0 || eight == 0 {
+		t.Fatalf("expected claim attempts for both runs, got concurrency1=%d concurrency8=%d", one, eight)
+	}
+
+	// The dispatcher refactor should keep claim volume roughly flat as executor
+	// concurrency increases. Allow some scheduling variance, but not linear growth.
+	if eight > one*2 {
+		t.Fatalf("expected claim attempts to stay roughly flat across concurrency; concurrency1=%d concurrency8=%d", one, eight)
+	}
+
+	t.Logf("claim attempts over 60ms: concurrency1=%d concurrency8=%d", one, eight)
 }

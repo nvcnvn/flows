@@ -57,6 +57,10 @@ type Worker struct {
 	// to complete when the worker is shutting down. If zero, the worker will
 	// wait indefinitely for all in-progress work to complete.
 	GracefulShutdownTimeout time.Duration
+
+	claimOneForWorkflowFunc func(ctx context.Context, runner workflowRunner, state *workflowState) (job claimedRun, claimed bool, err error)
+	onClaimAttempt          func(workflowName string)
+	disableCronLoop         bool
 }
 
 // workflowState tracks per-workflow state for shard rotation.
@@ -209,16 +213,18 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	// Start cron loop unconditionally. It is a no-op when the schedules table
 	// is empty, and picks up schedules created at runtime via ScheduleTx.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := w.runCronLoop(ctx, scheduleNotifyCh); err != nil {
-			select {
-			case errCh <- err:
-			default:
+	if !w.disableCronLoop {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := w.runCronLoop(ctx, scheduleNotifyCh); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Wait for context cancellation or error
 	select {
@@ -367,6 +373,13 @@ func (w *Worker) runWorkflowExecutor(ctx context.Context, jobCh <-chan claimedRu
 // On Citus, the query must include workflow_name_shard in the WHERE clause
 // so that FOR UPDATE SKIP LOCKED is routed to a single shard.
 func (w *Worker) claimOneForWorkflow(ctx context.Context, runner workflowRunner, state *workflowState) (job claimedRun, claimed bool, err error) {
+	if w.onClaimAttempt != nil {
+		w.onClaimAttempt(runner.workflowName())
+	}
+	if w.claimOneForWorkflowFunc != nil {
+		return w.claimOneForWorkflowFunc(ctx, runner, state)
+	}
+
 	workflowName := runner.workflowName()
 	shards := state.shards
 	if len(shards) == 0 {
