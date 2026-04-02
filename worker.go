@@ -39,7 +39,11 @@ type Worker struct {
 	Registry     *Registry
 	Codec        Codec
 	PollInterval time.Duration
-	DBConfig     DBConfig
+	// MaxPollInterval caps adaptive backoff after consecutive empty polls.
+	// If zero, workers back off up to 30s when LISTEN/NOTIFY is enabled.
+	// When notifications are disabled, polling stays at PollInterval.
+	MaxPollInterval time.Duration
+	DBConfig        DBConfig
 
 	// DisableNotify disables LISTEN/NOTIFY wakeups. Polling remains enabled.
 	DisableNotify bool
@@ -60,11 +64,62 @@ type workflowState struct {
 	shardRR uint64   // round-robin counter for shard rotation
 }
 
+type idleBackoff struct {
+	base    time.Duration
+	max     time.Duration
+	current time.Duration
+}
+
+func newIdleBackoff(base, max time.Duration) idleBackoff {
+	if base <= 0 {
+		base = 250 * time.Millisecond
+	}
+	if max < base {
+		max = base
+	}
+	return idleBackoff{base: base, max: max, current: base}
+}
+
+func (b *idleBackoff) next() time.Duration {
+	wait := b.current
+	if wait <= 0 {
+		wait = b.base
+	}
+	if b.current < b.max {
+		b.current *= 2
+		if b.current > b.max {
+			b.current = b.max
+		}
+	}
+	return wait
+}
+
+func (b *idleBackoff) reset() {
+	b.current = b.base
+}
+
 func (w *Worker) pollInterval() time.Duration {
 	if w.PollInterval <= 0 {
 		return 250 * time.Millisecond
 	}
 	return w.PollInterval
+}
+
+func (w *Worker) maxPollInterval() time.Duration {
+	base := w.pollInterval()
+	if w.DisableNotify {
+		return base
+	}
+	if w.MaxPollInterval <= 0 {
+		if base > 30*time.Second {
+			return base
+		}
+		return 30 * time.Second
+	}
+	if w.MaxPollInterval < base {
+		return base
+	}
+	return w.MaxPollInterval
 }
 
 func (w *Worker) notifyChannel() string {
@@ -220,6 +275,7 @@ func (w *Worker) listenLoop(ctx context.Context, runNotifyCh chan<- struct{}, sc
 // backoff rather than killing the worker. Only context cancellation causes
 // the loop to exit.
 func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state *workflowState, notifyCh <-chan struct{}) error {
+	idle := newIdleBackoff(w.pollInterval(), w.maxPollInterval())
 	for {
 		processed, err := w.processOneForWorkflow(ctx, workflowName, state)
 		if err != nil {
@@ -228,14 +284,16 @@ func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state
 				return ctx.Err()
 			}
 			// Transient error: back off and retry.
+			wait := idle.next()
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(w.pollInterval()):
+			case <-time.After(wait):
 			}
 			continue
 		}
 		if processed {
+			idle.reset()
 			continue
 		}
 
@@ -243,12 +301,14 @@ func (w *Worker) runWorkflowLoop(ctx context.Context, workflowName string, state
 			return ctx.Err()
 		}
 
-		// Wait for notification or poll interval
+		// Wait for notification or an adaptive poll interval.
+		wait := idle.next()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-notifyCh:
-		case <-time.After(w.pollInterval()):
+			idle.reset()
+		case <-time.After(wait):
 		}
 	}
 }

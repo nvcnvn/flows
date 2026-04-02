@@ -72,6 +72,10 @@ worker := flows.Worker{Pool: pool, Registry: reg, DBConfig: flows.DBConfig{Shard
 worker.Run(ctx)  // starts goroutine pools for each workflow type
 ```
 
+When LISTEN/NOTIFY is enabled, `PollInterval` is the base idle/retry delay and
+workers back off empty polls up to `MaxPollInterval` (default `30s`). When
+notifications are disabled, polling stays at `PollInterval`.
+
 ### Citus Compatibility
 
 On Citus, `SELECT ... FOR UPDATE SKIP LOCKED` must be routed to a single shard. The worker
