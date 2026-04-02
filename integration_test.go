@@ -3600,6 +3600,75 @@ func TestCronSchedule_ScheduleDeleteTx(t *testing.T) {
 	t.Logf("ScheduleDelete test: created=%d deleted=%d", afterCreate, afterDelete)
 }
 
+// TestCronSchedule_NotifyWakeupCreate ensures schedule creation wakes the cron
+// loop promptly even when PollInterval is long.
+func TestCronSchedule_NotifyWakeupCreate(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	registry := flows.NewRegistry()
+	wf := &CronWorkflow{}
+	flows.Register(registry, wf)
+
+	worker := &flows.Worker{
+		Pool:         pool,
+		Registry:     registry,
+		PollInterval: 5 * time.Second,
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(workerCtx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if n := wf.Executions.Load(); n != 0 {
+		t.Fatalf("Expected 0 executions before ScheduleTx, got %d", n)
+	}
+
+	client := flows.Client{}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	start := time.Now()
+	if err := flows.ScheduleTx(ctx, client, tx, wf,
+		&CronInput{Tag: "notify-schedule"},
+		"notify-cron",
+		flows.Every(60*time.Millisecond),
+	); err != nil {
+		t.Fatalf("ScheduleTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if wf.Executions.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if wf.Executions.Load() == 0 {
+		t.Fatal("Expected execution after ScheduleTx, got 0")
+	}
+	if took := time.Since(start); took >= worker.PollInterval {
+		t.Fatalf("expected schedule wakeup faster than poll interval; took=%v poll=%v", took, worker.PollInterval)
+	}
+
+	cancel()
+	err = <-errCh
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("worker returned error: %v", err)
+	}
+}
+
 // TestCronSchedule_WithRunNow verifies that WithRunNow fires an immediate run
 // in addition to setting up the recurring schedule.
 func TestCronSchedule_WithRunNow(t *testing.T) {

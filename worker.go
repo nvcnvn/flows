@@ -96,10 +96,11 @@ func (w *Worker) Run(ctx context.Context) error {
 		shardCount = 1
 	}
 
-	// Set up LISTEN/NOTIFY for low-latency wakeups
-	notifyCh := make(chan struct{}, 1)
+	// Set up LISTEN/NOTIFY for low-latency wakeups.
+	runNotifyCh := make(chan struct{}, 1)
+	scheduleNotifyCh := make(chan struct{}, 1)
 	if !w.DisableNotify {
-		go w.listenLoop(ctx, notifyCh)
+		go w.listenLoop(ctx, runNotifyCh, scheduleNotifyCh)
 	}
 
 	var wg sync.WaitGroup
@@ -119,7 +120,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			wg.Add(1)
 			go func(name string, st *workflowState) {
 				defer wg.Done()
-				if err := w.runWorkflowLoop(ctx, name, st, notifyCh); err != nil {
+				if err := w.runWorkflowLoop(ctx, name, st, runNotifyCh); err != nil {
 					select {
 					case errCh <- err:
 					default:
@@ -134,7 +135,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := w.runCronLoop(ctx, notifyCh); err != nil {
+		if err := w.runCronLoop(ctx, scheduleNotifyCh); err != nil {
 			select {
 			case errCh <- err:
 			default:
@@ -169,8 +170,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// listenLoop maintains a LISTEN connection and signals notifyCh on notifications.
-func (w *Worker) listenLoop(ctx context.Context, notifyCh chan<- struct{}) {
+// listenLoop maintains a LISTEN connection and routes notifications by payload.
+func (w *Worker) listenLoop(ctx context.Context, runNotifyCh chan<- struct{}, scheduleNotifyCh chan<- struct{}) {
 	for ctx.Err() == nil {
 		conn, err := w.Pool.Acquire(ctx)
 		if err != nil {
@@ -187,13 +188,19 @@ func (w *Worker) listenLoop(ctx context.Context, notifyCh chan<- struct{}) {
 
 		pgxConn := conn.Conn()
 		for {
-			_, err := pgxConn.WaitForNotification(ctx)
+			notification, err := pgxConn.WaitForNotification(ctx)
 			if err != nil {
 				break
 			}
-			// Non-blocking send to wake up workers
+			if notification != nil && notification.Payload == notifyPayloadScheduleRefresh {
+				select {
+				case scheduleNotifyCh <- struct{}{}:
+				default:
+				}
+				continue
+			}
 			select {
-			case notifyCh <- struct{}{}:
+			case runNotifyCh <- struct{}{}:
 			default:
 			}
 		}
@@ -396,10 +403,10 @@ func (w *Worker) ProcessOne(ctx context.Context) (processed bool, err error) {
 
 // -- Cron schedule support ----------------------------------------------------
 
-// runCronLoop periodically checks for due cron schedules and creates runs.
-func (w *Worker) runCronLoop(ctx context.Context, notifyCh chan<- struct{}) error {
+// runCronLoop sleeps until the next due schedule and wakes early on schedule changes.
+func (w *Worker) runCronLoop(ctx context.Context, scheduleNotifyCh <-chan struct{}) error {
 	for {
-		created, err := w.processOneCronSchedule(ctx, notifyCh)
+		created, err := w.processOneCronSchedule(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -417,17 +424,66 @@ func (w *Worker) runCronLoop(ctx context.Context, notifyCh chan<- struct{}) erro
 			continue
 		}
 
-		// No due schedules; wait.
+		nextRunAt, err := w.nextScheduleDueAt(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(w.pollInterval()):
+			}
+			continue
+		}
+
+		wait := w.pollInterval()
+		notifyCh := scheduleNotifyCh
+
+		if nextRunAt == nil {
+			if notifyCh == nil || w.DisableNotify {
+				notifyCh = nil
+			} else {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-notifyCh:
+				}
+				continue
+			}
+		} else {
+			untilNext := time.Until(*nextRunAt)
+			if untilNext < 0 {
+				untilNext = 0
+			}
+			if notifyCh != nil && !w.DisableNotify {
+				wait = untilNext
+			} else if untilNext < wait {
+				wait = untilNext
+				notifyCh = nil
+			} else {
+				notifyCh = nil
+			}
+		}
+
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return ctx.Err()
-		case <-time.After(w.pollInterval()):
+		case <-notifyCh:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 	}
 }
 
 // processOneCronSchedule claims one due schedule, creates a run, and advances next_run_at.
-func (w *Worker) processOneCronSchedule(ctx context.Context, notifyCh chan<- struct{}) (bool, error) {
+func (w *Worker) processOneCronSchedule(ctx context.Context) (bool, error) {
 	t := newDBTables(w.DBConfig)
 
 	tx, err := w.Pool.Begin(ctx)
@@ -448,6 +504,13 @@ func (w *Worker) processOneCronSchedule(ctx context.Context, notifyCh chan<- str
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = tx.Rollback(ctx)
 			return false, nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "3F000" || pgErr.Code == "42P01" {
+				_ = tx.Rollback(ctx)
+				return false, nil
+			}
 		}
 		return false, err
 	}
@@ -490,10 +553,26 @@ func (w *Worker) processOneCronSchedule(ctx context.Context, notifyCh chan<- str
 	// Hint workflow workers that a new run is available.
 	ch := w.notifyChannel()
 	_, _ = w.Pool.Exec(ctx, "SELECT pg_notify($1, $2)", ch, shard+":"+string(runID))
-	select {
-	case notifyCh <- struct{}{}:
-	default:
-	}
 
 	return true, nil
+}
+
+func (w *Worker) nextScheduleDueAt(ctx context.Context) (*time.Time, error) {
+	t := newDBTables(w.DBConfig)
+
+	var nextRunAt time.Time
+	err := w.Pool.QueryRow(ctx, t.nextScheduleDueAtSQL()).Scan(&nextRunAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "3F000" || pgErr.Code == "42P01" {
+				return nil, nil
+			}
+		}
+		return nil, err
+	}
+	return &nextRunAt, nil
 }

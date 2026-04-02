@@ -165,17 +165,19 @@ Flows supports automatic, recurring workflow runs via cron schedules.
 2. **Scheduling**: Call `flows.ScheduleTx(...)` — from an HTTP handler, a
    migration, init code, or anywhere you have a transaction — to create or
    update a schedule row in the `schedules` table.
-3. **Polling**: The worker's cron goroutine polls for schedules whose
-   `next_run_at <= now()`. It claims a row with `FOR UPDATE SKIP LOCKED`
-   (same pattern as workflow runs), inserts a new run, and advances
-   `next_run_at` — all in one transaction.
+3. **Wakeup model**: The worker's cron goroutine sleeps until the next
+    `next_run_at`, wakes early when schedule mutations send a notification,
+    then claims due rows with `FOR UPDATE SKIP LOCKED`, inserts a new run,
+    and advances `next_run_at` — all in one transaction.
 4. **Execution**: The new run is picked up by the normal workflow worker loop.
 
 Multiple workers share the same `schedules` table. `FOR UPDATE SKIP LOCKED`
 guarantees exactly one worker fires each schedule tick, so no duplicate runs.
 
 Because schedules live in the database, they can be created, updated, paused,
-resumed, and deleted at runtime without restarting workers.
+resumed, and deleted at runtime without restarting workers. When LISTEN/NOTIFY
+is enabled, those mutations wake cron workers immediately; otherwise workers
+fall back to periodic polling.
 
 ### Schedules
 

@@ -43,6 +43,10 @@ func (c Client) notifyChannel() string {
 	return normalizeNotifyChannel(c.NotifyChannel)
 }
 
+func (c Client) notifyScheduleChange(ctx context.Context, tx DBTX) {
+	_, _ = tx.Exec(ctx, "SELECT pg_notify($1, $2)", c.notifyChannel(), notifyPayloadScheduleRefresh)
+}
+
 // BeginTx enqueues a workflow run.
 //
 // Go does not support type parameters on methods, so this is a package-level generic.
@@ -222,8 +226,9 @@ func WithRunNow() ScheduleOption {
 // ScheduleTx creates or updates a cron schedule in the database.
 //
 // Call this at any time — from an HTTP handler, a migration, or application
-// init code. The worker's cron loop polls the schedules table, so new or
-// updated rows are picked up automatically on the next tick.
+// init code. The worker's cron loop recomputes its next wake time whenever a
+// schedule changes, and still falls back to periodic polling when LISTEN/NOTIFY
+// is disabled.
 //
 // If a schedule with the same scheduleID already exists it is updated (the
 // input and cron expression are replaced, and next_run_at is recalculated if
@@ -265,6 +270,8 @@ func ScheduleTx[I any, O any](ctx context.Context, c Client, tx DBTX, wf Workflo
 		return fmt.Errorf("create schedule: %w", err)
 	}
 
+	c.notifyScheduleChange(ctx, tx)
+
 	if options.runNow {
 		runIDStr, err := newUUIDv7(now)
 		if err != nil {
@@ -301,6 +308,7 @@ func DeleteScheduleTx(ctx context.Context, c Client, tx DBTX, scheduleID string)
 	if result.RowsAffected() == 0 {
 		return fmt.Errorf("schedule not found: %s", scheduleID)
 	}
+	c.notifyScheduleChange(ctx, tx)
 	return nil
 }
 
@@ -332,5 +340,6 @@ func setScheduleEnabled(ctx context.Context, c Client, tx DBTX, scheduleID strin
 	if result.RowsAffected() == 0 {
 		return fmt.Errorf("schedule not found: %s", scheduleID)
 	}
+	c.notifyScheduleChange(ctx, tx)
 	return nil
 }

@@ -262,6 +262,16 @@ func (t dbTables) claimDueScheduleSQL() string {
 	`
 }
 
+func (t dbTables) nextScheduleDueAtSQL() string {
+	return `
+		SELECT next_run_at
+		FROM ` + t.schedules + `
+		WHERE enabled = true
+		ORDER BY next_run_at
+		LIMIT 1
+	`
+}
+
 func (t dbTables) advanceScheduleSQL() string {
 	return `
 		UPDATE ` + t.schedules + `

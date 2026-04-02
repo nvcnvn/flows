@@ -16,6 +16,9 @@ const (
 	// notifyChannelRunWakeup is used with LISTEN/NOTIFY to hint workers to re-scan for runnable runs.
 	// Notifications are best-effort; workers must still poll as a fallback.
 	notifyChannelRunWakeup = "flows_run_wakeup"
+
+	// notifyPayloadScheduleRefresh tells cron workers to recompute their next wake time.
+	notifyPayloadScheduleRefresh = "schedule_refresh"
 )
 
 func normalizeNotifyChannel(ch string) string {
