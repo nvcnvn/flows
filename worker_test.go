@@ -2,6 +2,7 @@ package flows
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -72,47 +73,47 @@ func TestWorkerMaxPollInterval(t *testing.T) {
 	})
 }
 
-func TestWorkerDispatcherClaimVolumeStaysFlatAcrossConcurrency(t *testing.T) {
-	run := func(t *testing.T, concurrency int) int64 {
-		t.Helper()
+func measureWorkerClaimAttempts(tb testing.TB, concurrency int, duration time.Duration) int64 {
+	tb.Helper()
 
-		registry := NewRegistry()
-		Register(registry, noopWorkflow{name: "noop"}, WithConcurrency(concurrency))
+	registry := NewRegistry()
+	Register(registry, noopWorkflow{name: "noop"}, WithConcurrency(concurrency))
 
-		var attempts atomic.Int64
-		worker := &Worker{
-			Pool:            &pgxpool.Pool{},
-			Registry:        registry,
-			PollInterval:    5 * time.Millisecond,
-			DisableNotify:   true,
-			disableCronLoop: true,
-			onClaimAttempt: func(workflowName string) {
-				attempts.Add(1)
-			},
-			claimOneForWorkflowFunc: func(ctx context.Context, runner workflowRunner, state *workflowState) (claimedRun, bool, error) {
-				return claimedRun{}, false, nil
-			},
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- worker.Run(ctx)
-		}()
-
-		time.Sleep(60 * time.Millisecond)
-		cancel()
-
-		err := <-errCh
-		if err != nil && err != context.Canceled {
-			t.Fatalf("worker returned error: %v", err)
-		}
-
-		return attempts.Load()
+	var attempts atomic.Int64
+	worker := &Worker{
+		Pool:            &pgxpool.Pool{},
+		Registry:        registry,
+		PollInterval:    5 * time.Millisecond,
+		DisableNotify:   true,
+		disableCronLoop: true,
+		onClaimAttempt: func(workflowName string) {
+			attempts.Add(1)
+		},
+		claimOneForWorkflowFunc: func(ctx context.Context, runner workflowRunner, state *workflowState) (claimedRun, bool, error) {
+			return claimedRun{}, false, nil
+		},
 	}
 
-	one := run(t, 1)
-	eight := run(t, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.Run(ctx)
+	}()
+
+	time.Sleep(duration)
+	cancel()
+
+	err := <-errCh
+	if err != nil && err != context.Canceled {
+		tb.Fatalf("worker returned error: %v", err)
+	}
+
+	return attempts.Load()
+}
+
+func TestWorkerDispatcherClaimVolumeStaysFlatAcrossConcurrency(t *testing.T) {
+	one := measureWorkerClaimAttempts(t, 1, 60*time.Millisecond)
+	eight := measureWorkerClaimAttempts(t, 8, 60*time.Millisecond)
 
 	if one == 0 || eight == 0 {
 		t.Fatalf("expected claim attempts for both runs, got concurrency1=%d concurrency8=%d", one, eight)
@@ -125,4 +126,25 @@ func TestWorkerDispatcherClaimVolumeStaysFlatAcrossConcurrency(t *testing.T) {
 	}
 
 	t.Logf("claim attempts over 60ms: concurrency1=%d concurrency8=%d", one, eight)
+}
+
+func BenchmarkWorkerDispatcherClaimVolume(b *testing.B) {
+	const sampleWindow = 60 * time.Millisecond
+
+	for _, concurrency := range []int{1, 8} {
+		b.Run(fmt.Sprintf("concurrency_%d", concurrency), func(b *testing.B) {
+			b.ReportAllocs()
+
+			var total int64
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				total += measureWorkerClaimAttempts(b, concurrency, sampleWindow)
+			}
+			b.StopTimer()
+
+			seconds := float64(sampleWindow) * float64(b.N) / float64(time.Second)
+			b.ReportMetric(float64(total)/float64(b.N), "claim_attempts/op")
+			b.ReportMetric(float64(total)/seconds, "claim_attempts/s")
+		})
+	}
 }
