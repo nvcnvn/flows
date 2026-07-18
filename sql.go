@@ -104,10 +104,14 @@ func (t dbTables) selectWaitStateSQL() string {
 		WHERE workflow_name_shard = $1 AND run_id = $2 AND wait_key = $3 AND wait_type = $4`
 }
 
-func (t dbTables) satisfySleepWaitSQL() string {
+// satisfySleepWaitIfDueSQL marks a sleep wait satisfied only when it has
+// elapsed according to the database clock, which is the same clock the claim
+// query uses. Comparing against the Go clock here can busy-loop on skew.
+func (t dbTables) satisfySleepWaitIfDueSQL() string {
 	return `UPDATE ` + t.waits + `
 		SET satisfied_at = now(), updated_at = now()
-		WHERE workflow_name_shard = $1 AND run_id = $2 AND wait_key = $3`
+		WHERE workflow_name_shard = $1 AND run_id = $2 AND wait_key = $3
+		  AND satisfied_at IS NULL AND wake_at <= now()`
 }
 
 func (t dbTables) upsertSleepWaitSQL() string {
@@ -198,16 +202,33 @@ func (t dbTables) upsertRandomUint64SQL() string {
 }
 
 func (t dbTables) claimRunnableRunForShardSQL() string {
+	// The waiting_event branch closes a lost-wakeup race: a publisher can
+	// commit an event while the run's transaction is still executing (its
+	// committed status is not yet waiting_event), in which case the
+	// publisher's wake UPDATE matches nothing. Such runs are still runnable
+	// because an unsatisfied event wait has a matching event row.
 	return `
-		SELECT run_id, input_json
-		FROM ` + t.runs + `
-		WHERE workflow_name_shard = $3
-		  AND workflow_name = $4
+		SELECT r.run_id, r.input_json
+		FROM ` + t.runs + ` r
+		WHERE r.workflow_name_shard = $3
+		  AND r.workflow_name = $4
 		  AND (
-		    status = $1
-		    OR (status = $2 AND next_wake_at IS NOT NULL AND next_wake_at <= now())
+		    r.status = $1
+		    OR (r.status = $2 AND r.next_wake_at IS NOT NULL AND r.next_wake_at <= now())
+		    OR (r.status = $5 AND EXISTS (
+		      SELECT 1
+		      FROM ` + t.waits + ` w
+		      JOIN ` + t.events + ` e
+		        ON e.workflow_name_shard = $3
+		       AND e.run_id = w.run_id
+		       AND e.event_name = w.event_name
+		      WHERE w.workflow_name_shard = $3
+		        AND w.run_id = r.run_id
+		        AND w.wait_type = $6
+		        AND w.satisfied_at IS NULL
+		    ))
 		  )
-		ORDER BY created_at
+		ORDER BY r.created_at
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	`

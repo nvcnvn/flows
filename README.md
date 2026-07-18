@@ -77,6 +77,23 @@ When LISTEN/NOTIFY is enabled, `PollInterval` is the base idle/retry delay and
 workers back off empty polls up to `MaxPollInterval` (default `30s`). When
 notifications are disabled, polling stays at `PollInterval`.
 
+### Failure and shutdown semantics
+
+- A workflow that returns an error (or panics) marks the run `failed` —
+  terminal, no automatic re-run. If the workflow's own transaction was aborted
+  (e.g. a failed SQL statement via `Context.Tx()`), the failure is recorded in
+  a fresh transaction; a bad run never takes the worker down.
+- Per-run errors are never fatal to the worker. Set `Worker.Logger`
+  (`*slog.Logger`) to observe them; without it they are dropped.
+- On context cancellation the worker stops claiming new work and lets
+  in-flight runs finish. `GracefulShutdownTimeout` bounds that wait; when it
+  expires, in-flight executions are cancelled and their transactions roll
+  back, so those runs are simply re-claimed later.
+- Step memoization commits when the attempt's transaction commits (at a yield
+  or on completion). If a worker crashes mid-attempt, the attempt rolls back
+  and its steps re-execute on retry — step side effects that escape the
+  transaction (HTTP calls, emails) should be idempotent.
+
 ### Citus Compatibility
 
 On Citus, `SELECT ... FOR UPDATE SKIP LOCKED` must be routed to a single shard. The worker
@@ -196,6 +213,12 @@ Two schedule types are built-in:
 The cron parser supports standard 5-field syntax
 (`minute hour day-of-month month day-of-week`) with `*`, `N`, `N-M`, `N,M`,
 `*/N`, `N-M/S`, and `@every <duration>`. Day-of-week uses 0=Sunday (7 also accepted).
+
+Schedules are persisted as text and re-parsed by the worker, so a custom
+`Schedule` implementation must format to a valid cron expression or
+`@every <duration>`; `ScheduleTx` rejects schedules that don't round-trip.
+If a stored expression is ever unparseable anyway (e.g. edited by hand), the
+worker disables that schedule instead of stalling the cron loop.
 
 ### Quick start
 

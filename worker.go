@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,11 @@ type Worker struct {
 	// to complete when the worker is shutting down. If zero, the worker will
 	// wait indefinitely for all in-progress work to complete.
 	GracefulShutdownTimeout time.Duration
+
+	// Logger receives internal worker errors that would otherwise be silent
+	// (failed runs, claim errors, listen failures, disabled schedules).
+	// If nil, these errors are dropped.
+	Logger *slog.Logger
 
 	claimOneForWorkflowFunc func(ctx context.Context, runner workflowRunner, state *workflowState) (job claimedRun, claimed bool, err error)
 	onClaimAttempt          func(workflowName string)
@@ -139,6 +145,14 @@ func (w *Worker) notifyChannel() string {
 	return normalizeNotifyChannel(w.NotifyChannel)
 }
 
+// logError reports an internal worker error via the configured Logger.
+// It is a no-op when no Logger is set.
+func (w *Worker) logError(msg string, args ...any) {
+	if w.Logger != nil {
+		w.Logger.Error(msg, args...)
+	}
+}
+
 // Run starts the worker and blocks until ctx is cancelled.
 // Each registered workflow type gets one dispatcher goroutine that claims work
 // from Postgres and a bounded in-process executor pool that runs claimed work.
@@ -161,17 +175,29 @@ func (w *Worker) Run(ctx context.Context) error {
 		shardCount = 1
 	}
 
+	// runCtx governs claiming/polling; cancelling it stops new work.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	// execCtx governs in-flight workflow execution. It deliberately survives
+	// ctx cancellation so graceful shutdown can let claimed runs finish; it is
+	// cancelled once the shutdown grace period expires.
+	execCtx, cancelExec := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelExec()
+
 	// Set up LISTEN/NOTIFY for low-latency wakeups.
 	runNotifyCh := make(chan struct{}, 1)
 	scheduleNotifyCh := make(chan struct{}, 1)
 	if !w.DisableNotify {
-		go w.listenLoop(ctx, runNotifyCh, scheduleNotifyCh)
+		go w.listenLoop(runCtx, runNotifyCh, scheduleNotifyCh)
 	}
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
 
 	// Start one dispatcher plus an executor pool for each workflow type.
+	// Each dispatcher gets its own notify channel; a single notification must
+	// wake every dispatcher, not just whichever one happens to receive first.
+	dispatcherNotifyChs := make([]chan struct{}, 0, len(workflows))
 	for _, runner := range workflows {
 		concurrency := runner.concurrency()
 
@@ -179,6 +205,8 @@ func (w *Worker) Run(ctx context.Context) error {
 		state := &workflowState{
 			shards: ShardValuesForWorkflow(runner.workflowName(), shardCount),
 		}
+		notifyCh := make(chan struct{}, 1)
+		dispatcherNotifyChs = append(dispatcherNotifyChs, notifyCh)
 		jobCh := make(chan claimedRun, concurrency)
 		slots := make(chan struct{}, concurrency)
 		for i := 0; i < concurrency; i++ {
@@ -189,27 +217,39 @@ func (w *Worker) Run(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := w.runWorkflowExecutor(ctx, jobCh, slots); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-				}
+				w.runWorkflowExecutor(execCtx, jobCh, slots)
 			}()
 		}
 
 		wg.Add(1)
-		go func(r workflowRunner, st *workflowState) {
+		go func(r workflowRunner, st *workflowState, notifyCh <-chan struct{}) {
 			defer wg.Done()
 			defer close(jobCh)
-			if err := w.runWorkflowDispatcher(ctx, r, st, runNotifyCh, jobCh, slots); err != nil {
+			if err := w.runWorkflowDispatcher(runCtx, r, st, notifyCh, jobCh, slots); err != nil && runCtx.Err() == nil {
 				select {
 				case errCh <- err:
 				default:
 				}
 			}
-		}(runner, state)
+		}(runner, state, notifyCh)
 	}
+
+	// Fan a run notification out to every dispatcher.
+	go func() {
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-runNotifyCh:
+				for _, ch := range dispatcherNotifyChs {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}
+	}()
 
 	// Start cron loop unconditionally. It is a no-op when the schedules table
 	// is empty, and picks up schedules created at runtime via ScheduleTx.
@@ -217,7 +257,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := w.runCronLoop(ctx, scheduleNotifyCh); err != nil {
+			if err := w.runCronLoop(runCtx, scheduleNotifyCh); err != nil && runCtx.Err() == nil {
 				select {
 				case errCh <- err:
 				default:
@@ -226,46 +266,62 @@ func (w *Worker) Run(ctx context.Context) error {
 		}()
 	}
 
-	// Wait for context cancellation or error
+	// Wait for context cancellation or a fatal error.
+	var fatalErr error
 	select {
 	case <-ctx.Done():
-		// Graceful shutdown: wait for in-progress work to complete
-		if w.GracefulShutdownTimeout > 0 {
-			done := make(chan struct{})
-			go func() {
-				wg.Wait()
-				close(done)
-			}()
-
-			select {
-			case <-done:
-				// All workers finished gracefully
-			case <-time.After(w.GracefulShutdownTimeout):
-				// Timeout waiting for workers; they will be cancelled
-			}
-		} else {
-			// No timeout: wait indefinitely for all work to complete
-			wg.Wait()
-		}
-		return ctx.Err()
-	case err := <-errCh:
-		return err
+		fatalErr = ctx.Err()
+	case fatalErr = <-errCh:
 	}
+
+	// Stop claiming new work; dispatchers exit and close their job channels.
+	cancelRun()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	if w.GracefulShutdownTimeout > 0 {
+		select {
+		case <-done:
+			// All in-progress work finished gracefully.
+		case <-time.After(w.GracefulShutdownTimeout):
+			// Grace period expired: cancel in-flight executions and wait for
+			// goroutines to unwind so we don't leak them.
+			cancelExec()
+			<-done
+		}
+	} else {
+		// No timeout: wait indefinitely for all in-progress work to complete.
+		<-done
+	}
+	return fatalErr
 }
 
 // listenLoop maintains a LISTEN connection and routes notifications by payload.
 func (w *Worker) listenLoop(ctx context.Context, runNotifyCh chan<- struct{}, scheduleNotifyCh chan<- struct{}) {
+	retryWait := func() {
+		select {
+		case <-ctx.Done():
+		case <-time.After(w.pollInterval()):
+		}
+	}
 	for ctx.Err() == nil {
 		conn, err := w.Pool.Acquire(ctx)
 		if err != nil {
-			time.Sleep(w.pollInterval())
+			retryWait()
 			continue
 		}
 
 		ch := w.notifyChannel()
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			conn.Release()
-			time.Sleep(w.pollInterval())
+			if ctx.Err() == nil {
+				w.logError("flows: LISTEN failed", "channel", ch, "error", err)
+			}
+			retryWait()
 			continue
 		}
 
@@ -313,6 +369,7 @@ func (w *Worker) runWorkflowDispatcher(ctx context.Context, runner workflowRunne
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			w.logError("flows: claim run", "workflow", runner.workflowName(), "error", err)
 			// Transient error: back off and retry.
 			wait := idle.next()
 			select {
@@ -326,7 +383,9 @@ func (w *Worker) runWorkflowDispatcher(ctx context.Context, runner workflowRunne
 			idle.reset()
 			select {
 			case <-ctx.Done():
-				_ = job.tx.Rollback(ctx)
+				// ctx is already cancelled; use a detached context so the
+				// rollback still reaches the server and releases the row lock.
+				_ = job.tx.Rollback(context.WithoutCancel(ctx))
 				slots <- struct{}{}
 				return ctx.Err()
 			case jobCh <- job:
@@ -352,18 +411,17 @@ func (w *Worker) runWorkflowDispatcher(ctx context.Context, runner workflowRunne
 }
 
 // runWorkflowExecutor executes claimed runs for a specific workflow type.
-func (w *Worker) runWorkflowExecutor(ctx context.Context, jobCh <-chan claimedRun, slots chan<- struct{}) error {
+// Per-run errors are logged, never fatal: a single bad run (or a transient
+// DB error while persisting its outcome) must not take the worker down.
+func (w *Worker) runWorkflowExecutor(ctx context.Context, jobCh <-chan claimedRun, slots chan<- struct{}) {
 	for job := range jobCh {
 		err := w.executeClaimedRun(ctx, job)
 		slots <- struct{}{}
-		if err != nil {
-			if ctx.Err() != nil {
-				continue
-			}
-			return err
+		if err != nil && ctx.Err() == nil {
+			w.logError("flows: execute claimed run",
+				"workflow", job.runner.workflowName(), "run_id", job.runID, "error", err)
 		}
 	}
-	return nil
 }
 
 // claimOneForWorkflow claims at most one run for a specific workflow type.
@@ -424,7 +482,7 @@ func (w *Worker) claimOneShard(ctx context.Context, runner workflowRunner, workf
 
 	// Query with workflow_name_shard equality predicate for Citus compatibility.
 	// This ensures FOR UPDATE SKIP LOCKED is routed to a single shard.
-	err = tx.QueryRow(ctx, t.claimRunnableRunForShardSQL(), runStatusQueued, runStatusSleeping, shard, workflowName).
+	err = tx.QueryRow(ctx, t.claimRunnableRunForShardSQL(), runStatusQueued, runStatusSleeping, shard, workflowName, runStatusWaitingEvent, waitTypeEvent).
 		Scan(&runID, &inputJSON)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -493,9 +551,32 @@ func (w *Worker) executeClaimedRun(ctx context.Context, job claimedRun) (err err
 			return err
 		}
 
-		_, _ = tx.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error())
-		err = tx.Commit(ctx)
-		return err
+		// If the worker is shutting down, don't mark the run failed: roll back
+		// so it stays queued and another worker (or a restart) picks it up.
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return err
+		}
+
+		// Terminal failure: prefer recording it inside the workflow
+		// transaction so memoized steps and business writes commit with it.
+		_, execErr := tx.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error())
+		var commitErr error
+		if execErr == nil {
+			commitErr = tx.Commit(ctx)
+		}
+		if execErr != nil || commitErr != nil {
+			// The workflow transaction is unusable — typically aborted by a
+			// failed SQL statement inside the workflow. Roll it back and
+			// record the failure in a fresh transaction; otherwise the run
+			// stays queued and every worker that claims it fails the same way.
+			_ = tx.Rollback(ctx)
+			if _, ferr := w.Pool.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error()); ferr != nil {
+				err = fmt.Errorf("mark run %s failed after tx error: %w", job.runID, ferr)
+				return err
+			}
+		}
+		return nil
 	}
 
 	_, err = tx.Exec(ctx, t.setRunCompletedSQL(), job.shard, job.runID, runStatusCompleted, outputJSON)
@@ -653,8 +734,20 @@ func (w *Worker) processOneCronSchedule(ctx context.Context) (bool, error) {
 	// Parse the schedule from the stored cron expression.
 	sched, parseErr := ParseCron(cronExpr)
 	if parseErr != nil {
-		_ = tx.Rollback(ctx)
-		return false, fmt.Errorf("parse cron %q for schedule %s: %w", cronExpr, scheduleID, parseErr)
+		// A schedule with an unparseable expression would be re-claimed
+		// forever (it stays the earliest due row), starving every other
+		// schedule. Disable it instead so the cron loop keeps making progress.
+		_, disableErr := tx.Exec(ctx, t.setScheduleEnabledSQL(), scheduleID, false, time.Now())
+		if disableErr == nil {
+			disableErr = tx.Commit(ctx)
+		}
+		if disableErr != nil {
+			_ = tx.Rollback(ctx)
+			return false, fmt.Errorf("disable schedule %s with invalid cron %q: %w", scheduleID, cronExpr, disableErr)
+		}
+		w.logError("flows: disabled schedule with invalid cron expression",
+			"schedule_id", scheduleID, "cron_expr", cronExpr, "error", parseErr)
+		return true, nil
 	}
 
 	// Create the run.

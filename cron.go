@@ -10,6 +10,11 @@ import (
 // Schedule determines when the next workflow run should be created.
 //
 // Implementations must be deterministic: the same (after) input must produce the same output.
+//
+// Schedules are persisted as text and re-parsed by the worker via ParseCron,
+// so custom implementations must format (via String or %v) to a valid 5-field
+// cron expression or "@every <duration>". ScheduleTx rejects schedules that
+// don't round-trip.
 type Schedule interface {
 	// Next returns the earliest time after `after` at which the schedule fires.
 	// Returns the zero time if no future fire time exists (shouldn't happen for valid schedules).

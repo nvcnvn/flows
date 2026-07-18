@@ -625,15 +625,10 @@ func TestSleepAndWake(t *testing.T) {
 		t.Error("Should not process run while still sleeping")
 	}
 
-	// Wait for sleep to elapse
-	time.Sleep(150 * time.Millisecond)
-
-	// Now process should pick up the awakened run
-	processed, err = worker.ProcessOne(ctx)
-	if err != nil {
-		t.Fatalf("Failed to process run (after sleep): %v", err)
-	}
-	if !processed {
+	// Wait for the sleep to elapse and the run to become claimable. The wake
+	// deadline is evaluated against the database clock, so poll rather than
+	// assuming the Go clock and DB clock agree.
+	if !processOneEventually(t, worker, 5*time.Second) {
 		t.Error("Expected to process run after sleep elapsed")
 	}
 
@@ -755,6 +750,27 @@ func TestWaitForEvent(t *testing.T) {
 	if calls := wf.AfterWaitCalls.Load(); calls != 1 {
 		t.Errorf("Expected AfterWait to be called 1 time, got %d", calls)
 	}
+}
+
+// processOneEventually polls ProcessOne until it claims a run or the timeout
+// expires. Useful when waiting on a wake deadline evaluated by the database
+// clock, which may lag the Go clock.
+func processOneEventually(t *testing.T, worker *flows.Worker, timeout time.Duration) bool {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		processed, err := worker.ProcessOne(ctx)
+		if err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		if processed {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 func waitForRunStatus(t *testing.T, pool *pgxpool.Pool, runKey flows.RunKey, want string, timeout time.Duration) {
@@ -1374,10 +1390,10 @@ func TestMultipleSleeps(t *testing.T) {
 		t.Errorf("Expected 'sleeping', got '%s'", status)
 	}
 
-	// Wait and process again - completes first sleep, enters second
-	time.Sleep(60 * time.Millisecond)
-	processed, _ = worker.ProcessOne(ctx)
-	if !processed {
+	// Wait and process again - completes first sleep, enters second.
+	// The wake deadline is evaluated against the database clock, which can
+	// lag the Go clock (container/VM skew), so poll instead of sleeping once.
+	if !processOneEventually(t, worker, 5*time.Second) {
 		t.Error("Expected to process after first sleep")
 	}
 
@@ -1387,9 +1403,7 @@ func TestMultipleSleeps(t *testing.T) {
 	}
 
 	// Wait and process again - completes
-	time.Sleep(60 * time.Millisecond)
-	processed, _ = worker.ProcessOne(ctx)
-	if !processed {
+	if !processOneEventually(t, worker, 5*time.Second) {
 		t.Error("Expected to process after second sleep")
 	}
 
@@ -2574,23 +2588,31 @@ func TestConcurrentSleepingWorkflows(t *testing.T) {
 	// Wait for all runs to wake up
 	time.Sleep(sleepDuration + 50*time.Millisecond)
 
-	// Phase 2: Process all awakened runs with multiple workers
+	// Phase 2: Process all awakened runs with multiple workers. The wake
+	// deadline is evaluated against the database clock, so keep polling until
+	// everything completed rather than stopping at the first empty claim.
 	processedCount.Store(0)
+	deadline := time.Now().Add(10 * time.Second)
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			worker := newTestWorker(pool, registry, wf.Name())
-			for {
+			for time.Now().Before(deadline) {
 				processed, err := worker.ProcessOne(ctx)
 				if err != nil {
 					t.Errorf("Worker error: %v", err)
 					return
 				}
-				if !processed {
+				if processed {
+					processedCount.Add(1)
+					continue
+				}
+				var completed int
+				if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM flows.runs WHERE status = 'completed'").Scan(&completed); err == nil && completed >= numRuns {
 					return
 				}
-				processedCount.Add(1)
+				time.Sleep(10 * time.Millisecond)
 			}
 		}()
 	}
@@ -3580,6 +3602,10 @@ func TestCronSchedule_ScheduleDeleteTx(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
+	// A run created just before the delete committed may still execute
+	// (documented: in-progress runs are not affected). Let those drain
+	// before snapshotting the count.
+	time.Sleep(300 * time.Millisecond)
 	afterDelete := wf.Executions.Load()
 	time.Sleep(300 * time.Millisecond)
 	afterWait := wf.Executions.Load()

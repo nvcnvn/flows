@@ -190,6 +190,8 @@ func Sleep(ctx context.Context, c *Context, waitKey string, duration time.Durati
 	wakeAt := c.now().Add(duration)
 
 	// If we already have a sleep wait and it has elapsed, return.
+	// Elapsed-ness is decided by the database clock (same clock the claim
+	// query uses) so clock skew between worker and DB can't busy-loop the run.
 	{
 		var wakeAtDB time.Time
 		var satisfiedAt *time.Time
@@ -201,11 +203,14 @@ func Sleep(ctx context.Context, c *Context, waitKey string, duration time.Durati
 			if satisfiedAt != nil {
 				return
 			}
-			if !c.now().Before(wakeAtDB) {
-				_, _ = c.tx.Exec(ctx,
-					c.t.satisfySleepWaitSQL(),
-					c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey,
-				)
+			tag, execErr := c.tx.Exec(ctx,
+				c.t.satisfySleepWaitIfDueSQL(),
+				c.runKey.WorkflowNameShard, string(c.runKey.RunID), waitKey,
+			)
+			if execErr != nil {
+				panic(fmt.Errorf("satisfy sleep wait: %w", execErr))
+			}
+			if tag.RowsAffected() > 0 {
 				return
 			}
 			wakeAt = wakeAtDB

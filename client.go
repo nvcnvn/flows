@@ -259,6 +259,12 @@ func ScheduleTx[I any, O any](ctx context.Context, c Client, tx DBTX, wf Workflo
 	}
 
 	expr := scheduleExpr(schedule)
+	// The worker re-parses the stored expression on every fire. Reject
+	// schedules that don't round-trip up front; otherwise the row is disabled
+	// by the worker the first time it comes due.
+	if _, err := ParseCron(expr); err != nil {
+		return fmt.Errorf("schedule %T serializes to %q, which ParseCron cannot parse: %w", schedule, expr, err)
+	}
 	now := c.now()
 	nextRun := schedule.Next(now)
 	t := c.tables()
