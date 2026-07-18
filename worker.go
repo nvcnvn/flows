@@ -80,6 +80,7 @@ type claimedRun struct {
 	shard     string
 	runID     string
 	inputJSON []byte
+	attempts  int // failed attempts so far, read at claim time
 	tx        pgx.Tx
 }
 
@@ -479,11 +480,12 @@ func (w *Worker) claimOneShard(ctx context.Context, runner workflowRunner, workf
 
 	var runID string
 	var inputJSON []byte
+	var attempts int
 
 	// Query with workflow_name_shard equality predicate for Citus compatibility.
 	// This ensures FOR UPDATE SKIP LOCKED is routed to a single shard.
 	err = tx.QueryRow(ctx, t.claimRunnableRunForShardSQL(), runStatusQueued, runStatusSleeping, shard, workflowName, runStatusWaitingEvent, waitTypeEvent).
-		Scan(&runID, &inputJSON)
+		Scan(&runID, &inputJSON, &attempts)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = tx.Rollback(ctx)
@@ -511,6 +513,7 @@ func (w *Worker) claimOneShard(ctx context.Context, runner workflowRunner, workf
 		shard:     shard,
 		runID:     runID,
 		inputJSON: inputJSON,
+		attempts:  attempts,
 		tx:        tx,
 	}, true, nil
 }
@@ -558,9 +561,28 @@ func (w *Worker) executeClaimedRun(ctx context.Context, job claimedRun) (err err
 			return err
 		}
 
-		// Terminal failure: prefer recording it inside the workflow
-		// transaction so memoized steps and business writes commit with it.
-		_, execErr := tx.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error())
+		// Decide between a run-level retry and a terminal failure.
+		policy := job.runner.runRetry()
+		var terminalErr *TerminalError
+		retry := !errors.As(runErr, &terminalErr) && job.attempts+1 < policy.maxAttempts()
+		var backoffMillis int64
+		if retry && policy.Backoff != nil {
+			if d := policy.Backoff(job.attempts + 1); d > 0 {
+				backoffMillis = d.Milliseconds()
+			}
+		}
+		record := func(db DBTX) error {
+			if retry {
+				_, rerr := db.Exec(ctx, t.setRunRetryingSQL(), job.shard, job.runID, runStatusSleeping, runErr.Error(), backoffMillis)
+				return rerr
+			}
+			_, rerr := db.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error())
+			return rerr
+		}
+
+		// Prefer recording the outcome inside the workflow transaction so
+		// memoized steps and business writes commit with it.
+		execErr := record(tx)
 		var commitErr error
 		if execErr == nil {
 			commitErr = tx.Commit(ctx)
@@ -568,11 +590,11 @@ func (w *Worker) executeClaimedRun(ctx context.Context, job claimedRun) (err err
 		if execErr != nil || commitErr != nil {
 			// The workflow transaction is unusable — typically aborted by a
 			// failed SQL statement inside the workflow. Roll it back and
-			// record the failure in a fresh transaction; otherwise the run
+			// record the outcome in a fresh transaction; otherwise the run
 			// stays queued and every worker that claims it fails the same way.
 			_ = tx.Rollback(ctx)
-			if _, ferr := w.Pool.Exec(ctx, t.setRunFailedSQL(), job.shard, job.runID, runStatusFailed, runErr.Error()); ferr != nil {
-				err = fmt.Errorf("mark run %s failed after tx error: %w", job.runID, ferr)
+			if ferr := record(w.Pool); ferr != nil {
+				err = fmt.Errorf("record failed run %s after tx error: %w", job.runID, ferr)
 				return err
 			}
 		}

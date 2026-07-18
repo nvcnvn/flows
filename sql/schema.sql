@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS "flows"."runs" (
         input_json    jsonb NOT NULL,
         output_json   jsonb,
         error_text    text,
+        attempts      int NOT NULL DEFAULT 0,
         next_wake_at  timestamptz,
         created_at    timestamptz NOT NULL DEFAULT now(),
         updated_at    timestamptz NOT NULL DEFAULT now(),

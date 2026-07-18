@@ -40,7 +40,7 @@ func (t dbTables) wakeRunFromEventSQL() string {
 
 func (t dbTables) getRunStatusSQL() string {
 	return `
-		SELECT status, error_text, created_at, updated_at, next_wake_at
+		SELECT status, error_text, attempts, created_at, updated_at, next_wake_at
 		FROM ` + t.runs + `
 		WHERE workflow_name_shard = $1 AND run_id = $2
 	`
@@ -208,7 +208,7 @@ func (t dbTables) claimRunnableRunForShardSQL() string {
 	// publisher's wake UPDATE matches nothing. Such runs are still runnable
 	// because an unsatisfied event wait has a matching event row.
 	return `
-		SELECT r.run_id, r.input_json
+		SELECT r.run_id, r.input_json, r.attempts
 		FROM ` + t.runs + ` r
 		WHERE r.workflow_name_shard = $3
 		  AND r.workflow_name = $4
@@ -242,7 +242,17 @@ func (t dbTables) setRunRunningSQL() string {
 
 func (t dbTables) setRunFailedSQL() string {
 	return `UPDATE ` + t.runs + `
-		SET status = $3, error_text = $4, updated_at = now()
+		SET status = $3, error_text = $4, attempts = attempts + 1, updated_at = now()
+		WHERE workflow_name_shard = $1 AND run_id = $2`
+}
+
+// setRunRetryingSQL parks a failed run for a run-level retry: it becomes
+// sleeping with a wake time computed on the database clock (the same clock
+// the claim query compares against).
+func (t dbTables) setRunRetryingSQL() string {
+	return `UPDATE ` + t.runs + `
+		SET status = $3, error_text = $4, attempts = attempts + 1,
+			next_wake_at = now() + ($5 * interval '1 millisecond'), updated_at = now()
 		WHERE workflow_name_shard = $1 AND run_id = $2`
 }
 

@@ -77,12 +77,38 @@ When LISTEN/NOTIFY is enabled, `PollInterval` is the base idle/retry delay and
 workers back off empty polls up to `MaxPollInterval` (default `30s`). When
 notifications are disabled, polling stays at `PollInterval`.
 
+### Run-level retries
+
+By default a workflow error (or panic) fails the run on the first attempt.
+Opt in to automatic retries per workflow:
+
+```go
+flows.Register(reg, myWorkflow, flows.WithRunRetry(flows.RunRetryPolicy{
+	MaxAttempts: 5,                                              // initial attempt + 4 retries
+	Backoff:     flows.ExponentialBackoff(time.Second, time.Minute),
+}))
+```
+
+A retrying run is parked as `sleeping` with `next_wake_at = now() + backoff`
+and re-claimed like any other runnable run. Steps memoized by earlier attempts
+replay, so only the failing tail of the workflow re-executes. Wrap an error
+with `flows.Terminal(err)` to fail the run immediately (validation errors,
+business rejections). `GetRunStatusTx` exposes `Attempts` and the last error
+while a run is retrying.
+
+Upgrading an existing deployment requires one additive migration:
+
+```sql
+ALTER TABLE flows.runs ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0;
+```
+
 ### Failure and shutdown semantics
 
-- A workflow that returns an error (or panics) marks the run `failed` —
-  terminal, no automatic re-run. If the workflow's own transaction was aborted
-  (e.g. a failed SQL statement via `Context.Tx()`), the failure is recorded in
-  a fresh transaction; a bad run never takes the worker down.
+- A workflow that returns an error (or panics) marks the run `failed` once its
+  retry policy (if any) is exhausted — then terminal, no automatic re-run. If
+  the workflow's own transaction was aborted (e.g. a failed SQL statement via
+  `Context.Tx()`), the outcome is recorded in a fresh transaction; a bad run
+  never takes the worker down.
 - Per-run errors are never fatal to the worker. Set `Worker.Logger`
   (`*slog.Logger`) to observe them; without it they are dropped.
 - On context cancellation the worker stops claiming new work and lets
@@ -93,6 +119,17 @@ notifications are disabled, polling stays at `PollInterval`.
   or on completion). If a worker crashes mid-attempt, the attempt rolls back
   and its steps re-execute on retry — step side effects that escape the
   transaction (HTTP calls, emails) should be idempotent.
+- The whole attempt runs inside one Postgres transaction, so a slow workflow
+  (long steps, in-process step retries with backoff) holds a pool connection
+  and its row locks for that entire time. Keep steps short, use
+  `RetryPolicy.StepTimeout`, and mind server settings like
+  `idle_in_transaction_session_timeout` — a killed transaction simply rolls
+  the attempt back and the run is re-claimed.
+- Events are latches, not queues: one payload per `(run, event_name)`.
+  Publishing the same event again overwrites the payload, and a later
+  `WaitForEvent` with a new wait key on the same event name returns the stored
+  payload immediately instead of blocking. Use distinct event names when each
+  occurrence matters.
 
 ### Citus Compatibility
 

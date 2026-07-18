@@ -10,6 +10,7 @@ type workflowRunner interface {
 	workflowName() string
 	codec() Codec
 	concurrency() int
+	runRetry() RunRetryPolicy
 	run(ctx context.Context, wfCtx *Context, inputJSON []byte) (outputJSON []byte, err error)
 }
 
@@ -17,6 +18,7 @@ type registeredWorkflow[I any, O any] struct {
 	wf             Workflow[I, O]
 	codecImpl      Codec
 	concurrencyVal int
+	runRetryVal    RunRetryPolicy
 }
 
 func (r registeredWorkflow[I, O]) workflowName() string { return r.wf.Name() }
@@ -29,6 +31,8 @@ func (r registeredWorkflow[I, O]) concurrency() int {
 	}
 	return r.concurrencyVal
 }
+
+func (r registeredWorkflow[I, O]) runRetry() RunRetryPolicy { return r.runRetryVal }
 
 func (r registeredWorkflow[I, O]) run(ctx context.Context, wfCtx *Context, inputJSON []byte) ([]byte, error) {
 	var in I
@@ -49,6 +53,7 @@ type WorkflowOption func(*workflowOptions)
 type workflowOptions struct {
 	codec       Codec
 	concurrency int
+	runRetry    RunRetryPolicy
 }
 
 // WithCodec sets a custom codec for the workflow. If not set, JSONCodec is used.
@@ -63,6 +68,14 @@ func WithCodec(codec Codec) WorkflowOption {
 func WithConcurrency(n int) WorkflowOption {
 	return func(o *workflowOptions) {
 		o.concurrency = n
+	}
+}
+
+// WithRunRetry enables automatic run-level retries for this workflow.
+// By default a workflow error fails the run on the first attempt.
+func WithRunRetry(policy RunRetryPolicy) WorkflowOption {
+	return func(o *workflowOptions) {
+		o.runRetry = policy
 	}
 }
 
@@ -116,6 +129,7 @@ func register[I any, O any](r *Registry, wf Workflow[I, O], opts ...WorkflowOpti
 		wf:             wf,
 		codecImpl:      options.codec,
 		concurrencyVal: options.concurrency,
+		runRetryVal:    options.runRetry,
 	}
 	return nil
 }

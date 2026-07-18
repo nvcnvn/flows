@@ -115,10 +115,11 @@ func PublishEventTx[T any](ctx context.Context, c Client, tx DBTX, runKey RunKey
 // RunStatus represents the current state of a workflow run.
 type RunStatus struct {
 	Status     string // queued, running, sleeping, waiting_event, completed, failed, cancelled
-	Error      string // error message if failed
+	Error      string // last error message (set while retrying and when failed)
+	Attempts   int    // number of attempts that ended in an error so far
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
-	NextWakeAt *time.Time // when the run will wake (for sleeping status)
+	NextWakeAt *time.Time // when the run will wake (for sleeping status or a pending retry)
 }
 
 // GetRunStatusTx retrieves the current status of a workflow run.
@@ -131,6 +132,7 @@ func GetRunStatusTx(ctx context.Context, c Client, tx DBTX, runKey RunKey) (*Run
 	err := tx.QueryRow(ctx, t.getRunStatusSQL(), runKey.WorkflowNameShard, string(runKey.RunID)).Scan(
 		&status.Status,
 		&errorText,
+		&status.Attempts,
 		&status.CreatedAt,
 		&status.UpdatedAt,
 		&status.NextWakeAt,
